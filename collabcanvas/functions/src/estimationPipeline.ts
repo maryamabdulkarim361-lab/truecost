@@ -1,3 +1,4 @@
+import {safeLog} from './safeDiagnostics';
 /**
  * Estimation Pipeline Cloud Function
  * PRIMARY: Uses user annotations (polylines, polygons, bounding boxes) with scale for accurate measurements
@@ -10,7 +11,8 @@
  * - Enhanced LLM prompts for better accuracy
  */
 
-import { onCall, HttpsError } from 'firebase-functions/v2/https';
+import { HttpsError } from 'firebase-functions/v2/https';
+import { onCall, allowedOrigins } from './functionSecurity';
 import { OpenAI } from 'openai';
 import * as admin from 'firebase-admin';
 import { FieldValue } from 'firebase-admin/firestore';
@@ -30,7 +32,7 @@ function getOpenAI(): OpenAI {
   if (!_openai) {
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
-      console.error('[ESTIMATION_PIPELINE] OPENAI_API_KEY not configured');
+      safeLog('estimationPipeline.error', '[ESTIMATION_PIPELINE] OPENAI_API_KEY not configured');
       throw new Error('OPENAI_API_KEY not configured');
     }
     _openai = new OpenAI({ apiKey });
@@ -134,7 +136,7 @@ interface EstimationRequest {
 // CSI DIVISION TEMPLATE
 // ===================
 
-function createCSIScope(computedItems: Record<string, unknown[]>) {
+export function createCSIScope(computedItems: Record<string, unknown[]>) {
   const divisions = [
     { code: '01', key: 'div01_general_requirements', name: 'General Requirements' },
     { code: '02', key: 'div02_existing_conditions', name: 'Existing Conditions' },
@@ -259,17 +261,17 @@ async function imageUrlToBase64(imageUrl: string): Promise<string> {
   // SSRF protection: block local/private URLs in production
   if (isLocalUrl(imageUrl)) {
     if (process.env.FUNCTIONS_EMULATOR !== 'true') {
-      console.error('[SSRF] Blocked attempt to fetch local/private URL in production');
+      safeLog('estimationPipeline.error', '[SSRF] Blocked attempt to fetch local/private URL in production');
       throw new Error('Cannot fetch images from local or private addresses');
     }
     // In emulator mode, allow local URLs for development
-    console.log('[DEV] Allowing local URL fetch in emulator mode');
+    safeLog('estimationPipeline.log', '[DEV] Allowing local URL fetch in emulator mode');
   }
 
   try {
     const response = await fetch(imageUrl);
     if (!response.ok) {
-      console.error(`[IMAGE] Fetch failed with status ${response.status}`);
+      safeLog('estimationPipeline.error', `[IMAGE] Fetch failed with status ${response.status}`);
       throw new Error('Failed to fetch image');
     }
 
@@ -282,11 +284,11 @@ async function imageUrlToBase64(imageUrl: string): Promise<string> {
       if (parsedType.startsWith('image/')) {
         mimeType = parsedType;
       } else {
-        console.error(`[IMAGE] Invalid Content-Type received: ${parsedType}`);
+        safeLog('estimationPipeline.error', `[IMAGE] Invalid Content-Type received: ${parsedType}`);
         throw new Error('Response is not an image');
       }
     } else {
-      console.warn('[IMAGE] No Content-Type header, defaulting to image/jpeg');
+      safeLog('estimationPipeline.warn', '[IMAGE] No Content-Type header, defaulting to image/jpeg');
     }
 
     const arrayBuffer = await response.arrayBuffer();
@@ -296,7 +298,7 @@ async function imageUrlToBase64(imageUrl: string): Promise<string> {
     return `data:${mimeType};base64,${base64}`;
   } catch (error) {
     // Log error internally but re-throw with minimal detail
-    console.error('[IMAGE] Error processing image:', error instanceof Error ? error.message : 'Unknown error');
+    safeLog('estimationPipeline.error', '[IMAGE] Error processing image:', error instanceof Error ? error.message : 'Unknown error');
     throw new Error('Failed to process image');
   }
 }
@@ -343,255 +345,14 @@ async function prepareImageForInference(planImageUrl: string): Promise<string> {
 // CLOUD FUNCTION
 // ===================
 
-export const estimationPipeline = onCall({
-  cors: true,
-  secrets: ['OPENAI_API_KEY'],
-  timeoutSeconds: 300,
-  memory: '1GiB',
-}, async (request) => {
-  try {
-    const data = request.data as EstimationRequest;
-    const {
-      projectId,
-      sessionId,
-      planImageUrl,
-      scopeText,
-      clarificationData,
-      annotationSnapshot,
-      clarificationContext: providedContext,
-      passNumber = 1,
-    } = data;
-
-    if (!scopeText) {
-      throw new HttpsError('invalid-argument', 'Scope text is required');
-    }
-
-    if (!projectId) {
-      throw new HttpsError('invalid-argument', 'Project ID is required');
-    }
-
-    if (!sessionId) {
-      throw new HttpsError('invalid-argument', 'Session ID is required');
-    }
-
-    // ===================
-    // AUTHENTICATION & AUTHORIZATION
-    // ===================
-    if (!request.auth) {
-      throw new HttpsError('unauthenticated', 'User must be authenticated');
-    }
-
-    const userId = request.auth.uid;
-
-    // Initialize Firestore early for auth checks
-    initFirebaseAdmin();
-    const db = admin.firestore();
-
-    // Verify user has access to this project (owner or collaborator)
-    const projectRef = db.collection('projects').doc(projectId);
-    const projectDoc = await projectRef.get();
-
-    if (!projectDoc.exists) {
-      throw new HttpsError('not-found', 'Project not found');
-    }
-
-    const projectData = projectDoc.data();
-    if (projectData?.ownerId !== userId) {
-      // Check if user is a collaborator
-      const collaborators = projectData?.collaborators || [];
-      const isCollaborator = collaborators.some(
-        (c: { id: string }) => c.id === userId
-      );
-      if (!isCollaborator) {
-        throw new HttpsError('permission-denied', 'User does not have access to this project');
-      }
-    }
-
-    console.log(`[ESTIMATION] Starting pass ${passNumber} for session ${sessionId}`);
-
-    // ===================
-    // LOAD CLARIFICATION CONTEXT FROM FIRESTORE (if not provided)
-    // ===================
-    let clarificationContext: ClarificationContext = providedContext || {};
-
-    // Try to load from Firestore if not provided (db and userId already initialized above)
-    if (!providedContext) {
-      try {
-        const contextDoc = await db
-          .collection('users')
-          .doc(userId)
-          .collection('projects')
-          .doc(projectId)
-          .collection('context')
-          .doc('clarifications')
-          .get();
-
-        if (contextDoc.exists) {
-          const contextData = contextDoc.data();
-          clarificationContext = contextData?.clarifications || {};
-          console.log('[ESTIMATION] Loaded clarification context from Firestore:', clarificationContext);
-        }
-      } catch (err) {
-        console.warn('[ESTIMATION] Could not load clarification context:', err);
-      }
-    }
-    
-    console.log('[ESTIMATION] Using clarification context:', {
-      hasExclusions: Object.keys(clarificationContext.exclusions || {}).length > 0,
-      hasInclusions: Object.keys(clarificationContext.inclusions || {}).length > 0,
-      hasAreaRelationships: Object.keys(clarificationContext.areaRelationships || {}).length > 0,
-      confirmedQuantities: clarificationContext.confirmedQuantities,
-    });
-
-    // ===================
-    // STEP 1: COMPUTE QUANTITIES FROM ANNOTATIONS (PRIMARY)
-    // ===================
-    console.log('[ESTIMATION] Computing quantities from user annotations...');
-
-    // Defensive null-safety: guard against annotationSnapshot being undefined/null
-    const safeAnnotationSnapshot = annotationSnapshot ?? { shapes: [], layers: [] };
-
-    // Ensure layers have required fields
-    const normalizedSnapshot: AnnotationSnapshot = {
-      shapes: safeAnnotationSnapshot.shapes || [],
-      layers: (safeAnnotationSnapshot.layers || []).map(layer => ({
-        id: layer?.id ?? '',
-        name: layer?.name ?? '',
-        visible: (layer as AnnotatedLayer)?.visible ?? true,
-        shapeCount: (layer as AnnotatedLayer)?.shapeCount ?? 0,
-      })),
-      scale: safeAnnotationSnapshot.scale,
-      capturedAt: safeAnnotationSnapshot.capturedAt || Date.now(),
-    };
-
-    const quantities = computeQuantitiesFromAnnotations(normalizedSnapshot);
-
-    console.log('[ESTIMATION] Computed from annotations:', {
-      hasScale: quantities.hasScale,
-      scaleUnit: quantities.scaleUnit,
-      totalWallLength: quantities.totalWallLength,
-      totalFloorArea: quantities.totalFloorArea,
-      roomCount: quantities.totalRoomCount,
-      doorCount: quantities.totalDoorCount,
-      windowCount: quantities.totalWindowCount,
-    });
-
-    // ===================
-    // STEP 2: BUILD SPACE MODEL FROM ANNOTATIONS
-    // ===================
-    console.log('[ESTIMATION] Building space model from computed quantities...');
-    const spaceModel = buildSpaceModelFromQuantities(quantities);
-
-    // ===================
-    // STEP 3: DETERMINE PROJECT CONTEXT
-    // ===================
-    const projectType = (clarificationData.projectType as string) || 
-                        inferProjectType(scopeText) || 'other';
-    const finishLevel = (clarificationData.finishLevel as 'budget' | 'mid_range' | 'high_end' | 'luxury') || 'mid_range';
-    
-    console.log(`[ESTIMATION] Project type: ${projectType}, Finish level: ${finishLevel}`);
-
-    // ===================
-    // STEP 4: BUILD ENHANCED CSI ITEMS FROM ANNOTATIONS
-    // ===================
-    console.log('[ESTIMATION] Building enhanced CSI items from computed quantities...');
-    
-    // Apply confirmed quantities from clarification context
-    if (clarificationContext.confirmedQuantities) {
-      if (clarificationContext.confirmedQuantities.doors !== undefined) {
-        console.log(`[ESTIMATION] Using confirmed door count: ${clarificationContext.confirmedQuantities.doors}`);
-        // Override door count if user confirmed a specific number
-        quantities.totalDoorCount = clarificationContext.confirmedQuantities.doors;
-      }
-      if (clarificationContext.confirmedQuantities.windows !== undefined) {
-        console.log(`[ESTIMATION] Using confirmed window count: ${clarificationContext.confirmedQuantities.windows}`);
-        quantities.totalWindowCount = clarificationContext.confirmedQuantities.windows;
-      }
-    }
-    
-    const projectContext = {
-      projectType,
-      finishLevel,
-      scopeText,
-      clarificationData,
-      clarificationContext, // Pass the full context for detailed processing
-    };
-    let computedCSIItems: Record<string, unknown[]> = buildEnhancedCSIItems(quantities, projectContext);
-
-    // ===================
-    // STEP 5: EXTRACT PROJECT-SPECIFIC DATA
-    // ===================
-    console.log('[ESTIMATION] Extracting project-specific data...');
-    const projectSpecificData = extractProjectSpecificData(
-      quantities,
-      projectType,
-      clarificationData,
-      scopeText
-    );
-
-    // ===================
-    // STEP 6: LLM INFERENCE FOR GAP-FILLING (SECONDARY)
-    // ===================
-    let inferenceResult = null;
-    let spatialNarrative = '';
-
-    // Only use LLM if we have annotations but need inference for non-measured items
-    if (quantities.hasScale && (quantities.totalWallLength > 0 || quantities.totalFloorArea > 0)) {
-      if (process.env.OPENAI_API_KEY) {
-        console.log('[ESTIMATION] Running enhanced LLM inference for gap-filling...');
-        const openai = getOpenAI();
-        
-        // Prepare image URL if available (handles local URL conversion and SSRF protection)
-        const imageUrl = planImageUrl ? await prepareImageForInference(planImageUrl) : planImageUrl;
-        
-        inferenceResult = await runEnhancedInference(
-          openai,
-          quantities,
-          projectType,
-          finishLevel,
-          scopeText,
-          clarificationData,
-          imageUrl
-        );
-
-        // Safely access inferenceResult properties with defaults
-        spatialNarrative = inferenceResult?.spatialNarrative ?? '';
-
-        // Merge inferred items into CSI items (only if inferenceResult exists)
-        if (inferenceResult) {
-          computedCSIItems = mergeInferenceIntoCSI(computedCSIItems, inferenceResult);
-        }
-
-        const inferredItemsCount = (inferenceResult?.inferredItems ?? []).length;
-        const allowancesCount = (inferenceResult?.standardAllowances ?? []).length;
-        const ambiguitiesCount = (inferenceResult?.scopeAmbiguities ?? []).length;
-
-        console.log(`[ESTIMATION] LLM inference added ${inferredItemsCount} items, ${allowancesCount} allowances`);
-        if (ambiguitiesCount > 0) {
-          console.log(`[ESTIMATION] Found ${ambiguitiesCount} scope ambiguities for review`);
-        }
-      } else {
-        console.log('[ESTIMATION] No API key - using annotation data only');
-      }
-    } else if (!quantities.hasScale) {
-      console.log('[ESTIMATION] No scale set - using annotation data only');
-    } else {
-      console.log('[ESTIMATION] No annotations - using defaults only');
-    }
-    
-    // Generate layout narrative from extracted data if LLM didn't provide one
-    if (!spatialNarrative || spatialNarrative.length < 200) {
-      spatialNarrative = generateLayoutNarrative(quantities, projectType, projectSpecificData);
-    }
-
-    // Create CSI scope with computed + inferred items
-    const csiScope = createCSIScope(computedCSIItems);
-
-    // ===================
-    // STEP 6: ASSEMBLE CLARIFICATION OUTPUT
-    // ===================
-    const estimateId = `est_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-
+export function assembleClarificationOutput(args: {
+  estimateId: string; csiScope: Record<string, unknown>;
+  quantities: ReturnType<typeof computeQuantitiesFromAnnotations>;
+  clarificationData: Record<string, unknown>; scopeText: string; planImageUrl: string | null;
+  spaceModel: Record<string, unknown>; projectSpecificData: ReturnType<typeof extractProjectSpecificData>;
+  spatialNarrative: string; inferenceResult: any;
+}) {
+  const {estimateId,csiScope,quantities,clarificationData,scopeText,planImageUrl,spaceModel,projectSpecificData,spatialNarrative,inferenceResult}=args;
     // Count divisions by status
     const divisionCounts = { included: 0, excluded: 0, byOwner: 0, notApplicable: 0 };
     const includedDivisions: string[] = [];
@@ -677,7 +438,7 @@ export const estimationPipeline = onCall({
         entryPoints: [],
       },
     };
-    
+
     // Add project-specific data based on project type
     if (projectSpecificData.kitchenSpecific) {
       cadData.kitchenSpecific = projectSpecificData.kitchenSpecific;
@@ -760,23 +521,287 @@ export const estimationPipeline = onCall({
     // ===================
     // STEP 8: VALIDATE AND AUTO-FIX OUTPUT
     // ===================
-    console.log('[ESTIMATION] Validating ClarificationOutput...');
-    
+    safeLog('estimationPipeline.log', '[ESTIMATION] Validating ClarificationOutput...');
+
     // First validate
     const validationResult = validateClarificationOutput(clarificationOutput);
-    console.log(`[ESTIMATION] Validation: ${validationResult.isValid ? 'PASSED' : 'NEEDS FIXES'}, Score: ${validationResult.completenessScore}/100`);
-    
+    safeLog('estimationPipeline.log', `[ESTIMATION] Validation: ${validationResult.isValid ? 'PASSED' : 'NEEDS FIXES'}, Score: ${validationResult.completenessScore}/100`);
+
     if (validationResult.errors.length > 0) {
-      console.log(`[ESTIMATION] Found ${validationResult.errors.length} errors, ${validationResult.warnings.length} warnings`);
-      console.log(getValidationSummary(validationResult));
+      safeLog('estimationPipeline.log', `[ESTIMATION] Found ${validationResult.errors.length} errors, ${validationResult.warnings.length} warnings`);
+      safeLog('estimationPipeline.log', getValidationSummary(validationResult));
     }
-    
+
     // Auto-fix common issues
     const fixedOutput = autoFixClarificationOutput(clarificationOutput);
-    
+
     // Re-validate after fix
     const finalValidation = validateClarificationOutput(fixedOutput);
-    console.log(`[ESTIMATION] After auto-fix: ${finalValidation.isValid ? 'PASSED' : 'STILL HAS ISSUES'}, Score: ${finalValidation.completenessScore}/100`);
+    safeLog('estimationPipeline.log', `[ESTIMATION] After auto-fix: ${finalValidation.isValid ? 'PASSED' : 'STILL HAS ISSUES'}, Score: ${finalValidation.completenessScore}/100`);
+
+  // Never advertise incomplete/invalid producer data as ready for strict start.
+  // Preserve the supplied values for review; do not repair construction facts.
+  const blockingWarnings = new Set(['INCOMPLETE_LOCATION','INVALID_PROJECT_TYPE','INVALID_FINISH_LEVEL','INVALID_COMPLEXITY','INVALID_SQFT']);
+  const requiresReview = !finalValidation.isValid || finalValidation.warnings.some(w => blockingWarnings.has(w.code)) ||
+    !planImageUrl || (fixedOutput.flags as {userVerificationRequired:boolean}).userVerificationRequired;
+  if (requiresReview) {
+    fixedOutput.clarificationStatus = 'needs_review';
+    (fixedOutput.flags as {userVerificationRequired:boolean}).userVerificationRequired = true;
+  }
+  return {fixedOutput, finalValidation};
+}
+
+export const estimationPipeline = onCall({
+  cors: allowedOrigins(),
+  secrets: ['OPENAI_API_KEY'],
+  timeoutSeconds: 300,
+  memory: '1GiB',
+}, async (request) => {
+  try {
+    const data = request.data as EstimationRequest;
+    const {
+      projectId,
+      sessionId,
+      planImageUrl,
+      scopeText,
+      clarificationData,
+      annotationSnapshot,
+      clarificationContext: providedContext,
+      passNumber = 1,
+    } = data;
+
+    if (!scopeText) {
+      throw new HttpsError('invalid-argument', 'Scope text is required');
+    }
+
+    if (!projectId) {
+      throw new HttpsError('invalid-argument', 'Project ID is required');
+    }
+
+    if (!sessionId) {
+      throw new HttpsError('invalid-argument', 'Session ID is required');
+    }
+
+    // ===================
+    // AUTHENTICATION & AUTHORIZATION
+    // ===================
+    if (!request.auth) {
+      throw new HttpsError('unauthenticated', 'User must be authenticated');
+    }
+
+    const userId = request.auth.uid;
+
+    // Initialize Firestore early for auth checks
+    initFirebaseAdmin();
+    const db = admin.firestore();
+
+    // Verify user has access to this project (owner or collaborator)
+    const projectRef = db.collection('projects').doc(projectId);
+    const projectDoc = await projectRef.get();
+
+    if (!projectDoc.exists) {
+      throw new HttpsError('not-found', 'Project not found');
+    }
+
+    const projectData = projectDoc.data();
+    if (projectData?.ownerId !== userId) {
+      // Check if user is a collaborator
+      const collaborators = projectData?.collaborators || [];
+      const isCollaborator = collaborators.some(
+        (c: { userId: string; role: string }) => c.userId === userId && c.role === 'editor'
+      );
+      if (!isCollaborator) {
+        throw new HttpsError('permission-denied', 'User does not have access to this project');
+      }
+    }
+
+    safeLog('estimationPipeline.log', `[ESTIMATION] Starting pass ${passNumber} for session ${sessionId}`);
+
+    // ===================
+    // LOAD CLARIFICATION CONTEXT FROM FIRESTORE (if not provided)
+    // ===================
+    let clarificationContext: ClarificationContext = providedContext || {};
+
+    // Try to load from Firestore if not provided (db and userId already initialized above)
+    if (!providedContext) {
+      try {
+        const contextDoc = await db
+          .collection('users')
+          .doc(userId)
+          .collection('projects')
+          .doc(projectId)
+          .collection('context')
+          .doc('clarifications')
+          .get();
+
+        if (contextDoc.exists) {
+          const contextData = contextDoc.data();
+          clarificationContext = contextData?.clarifications || {};
+          safeLog('estimationPipeline.log', '[ESTIMATION] Loaded clarification context from Firestore:', clarificationContext);
+        }
+      } catch (err) {
+        safeLog('estimationPipeline.warn', '[ESTIMATION] Could not load clarification context:', err);
+      }
+    }
+    
+    safeLog('estimationPipeline.log', '[ESTIMATION] Using clarification context:', {
+      hasExclusions: Object.keys(clarificationContext.exclusions || {}).length > 0,
+      hasInclusions: Object.keys(clarificationContext.inclusions || {}).length > 0,
+      hasAreaRelationships: Object.keys(clarificationContext.areaRelationships || {}).length > 0,
+      confirmedQuantities: clarificationContext.confirmedQuantities,
+    });
+
+    // ===================
+    // STEP 1: COMPUTE QUANTITIES FROM ANNOTATIONS (PRIMARY)
+    // ===================
+    safeLog('estimationPipeline.log', '[ESTIMATION] Computing quantities from user annotations...');
+
+    // Defensive null-safety: guard against annotationSnapshot being undefined/null
+    const safeAnnotationSnapshot = annotationSnapshot ?? { shapes: [], layers: [] };
+
+    // Ensure layers have required fields
+    const normalizedSnapshot: AnnotationSnapshot = {
+      shapes: safeAnnotationSnapshot.shapes || [],
+      layers: (safeAnnotationSnapshot.layers || []).map(layer => ({
+        id: layer?.id ?? '',
+        name: layer?.name ?? '',
+        visible: (layer as AnnotatedLayer)?.visible ?? true,
+        shapeCount: (layer as AnnotatedLayer)?.shapeCount ?? 0,
+      })),
+      scale: safeAnnotationSnapshot.scale,
+      capturedAt: safeAnnotationSnapshot.capturedAt || Date.now(),
+    };
+
+    const quantities = computeQuantitiesFromAnnotations(normalizedSnapshot);
+
+    safeLog('estimationPipeline.log', '[ESTIMATION] Computed from annotations:', {
+      hasScale: quantities.hasScale,
+      scaleUnit: quantities.scaleUnit,
+      totalWallLength: quantities.totalWallLength,
+      totalFloorArea: quantities.totalFloorArea,
+      roomCount: quantities.totalRoomCount,
+      doorCount: quantities.totalDoorCount,
+      windowCount: quantities.totalWindowCount,
+    });
+
+    // ===================
+    // STEP 2: BUILD SPACE MODEL FROM ANNOTATIONS
+    // ===================
+    safeLog('estimationPipeline.log', '[ESTIMATION] Building space model from computed quantities...');
+    const spaceModel = buildSpaceModelFromQuantities(quantities);
+
+    // ===================
+    // STEP 3: DETERMINE PROJECT CONTEXT
+    // ===================
+    const projectType = (clarificationData.projectType as string) || 
+                        inferProjectType(scopeText) || 'other';
+    const finishLevel = (clarificationData.finishLevel as 'budget' | 'mid_range' | 'high_end' | 'luxury') || 'mid_range';
+    
+    safeLog('estimationPipeline.log', `[ESTIMATION] Project type: ${projectType}, Finish level: ${finishLevel}`);
+
+    // ===================
+    // STEP 4: BUILD ENHANCED CSI ITEMS FROM ANNOTATIONS
+    // ===================
+    safeLog('estimationPipeline.log', '[ESTIMATION] Building enhanced CSI items from computed quantities...');
+    
+    // Apply confirmed quantities from clarification context
+    if (clarificationContext.confirmedQuantities) {
+      if (clarificationContext.confirmedQuantities.doors !== undefined) {
+        safeLog('estimationPipeline.log', `[ESTIMATION] Using confirmed door count: ${clarificationContext.confirmedQuantities.doors}`);
+        // Override door count if user confirmed a specific number
+        quantities.totalDoorCount = clarificationContext.confirmedQuantities.doors;
+      }
+      if (clarificationContext.confirmedQuantities.windows !== undefined) {
+        safeLog('estimationPipeline.log', `[ESTIMATION] Using confirmed window count: ${clarificationContext.confirmedQuantities.windows}`);
+        quantities.totalWindowCount = clarificationContext.confirmedQuantities.windows;
+      }
+    }
+    
+    const projectContext = {
+      projectType,
+      finishLevel,
+      scopeText,
+      clarificationData,
+      clarificationContext, // Pass the full context for detailed processing
+    };
+    let computedCSIItems: Record<string, unknown[]> = buildEnhancedCSIItems(quantities, projectContext);
+
+    // ===================
+    // STEP 5: EXTRACT PROJECT-SPECIFIC DATA
+    // ===================
+    safeLog('estimationPipeline.log', '[ESTIMATION] Extracting project-specific data...');
+    const projectSpecificData = extractProjectSpecificData(
+      quantities,
+      projectType,
+      clarificationData,
+      scopeText
+    );
+
+    // ===================
+    // STEP 6: LLM INFERENCE FOR GAP-FILLING (SECONDARY)
+    // ===================
+    let inferenceResult = null;
+    let spatialNarrative = '';
+
+    // Only use LLM if we have annotations but need inference for non-measured items
+    if (quantities.hasScale && (quantities.totalWallLength > 0 || quantities.totalFloorArea > 0)) {
+      if (process.env.OPENAI_API_KEY) {
+        safeLog('estimationPipeline.log', '[ESTIMATION] Running enhanced LLM inference for gap-filling...');
+        const openai = getOpenAI();
+        
+        // Prepare image URL if available (handles local URL conversion and SSRF protection)
+        const imageUrl = planImageUrl ? await prepareImageForInference(planImageUrl) : planImageUrl;
+        
+        inferenceResult = await runEnhancedInference(
+          openai,
+          quantities,
+          projectType,
+          finishLevel,
+          scopeText,
+          clarificationData,
+          imageUrl
+        );
+
+        // Safely access inferenceResult properties with defaults
+        spatialNarrative = inferenceResult?.spatialNarrative ?? '';
+
+        // Merge inferred items into CSI items (only if inferenceResult exists)
+        if (inferenceResult) {
+          computedCSIItems = mergeInferenceIntoCSI(computedCSIItems, inferenceResult);
+        }
+
+        const inferredItemsCount = (inferenceResult?.inferredItems ?? []).length;
+        const allowancesCount = (inferenceResult?.standardAllowances ?? []).length;
+        const ambiguitiesCount = (inferenceResult?.scopeAmbiguities ?? []).length;
+
+        safeLog('estimationPipeline.log', `[ESTIMATION] LLM inference added ${inferredItemsCount} items, ${allowancesCount} allowances`);
+        if (ambiguitiesCount > 0) {
+          safeLog('estimationPipeline.log', `[ESTIMATION] Found ${ambiguitiesCount} scope ambiguities for review`);
+        }
+      } else {
+        safeLog('estimationPipeline.log', '[ESTIMATION] No API key - using annotation data only');
+      }
+    } else if (!quantities.hasScale) {
+      safeLog('estimationPipeline.log', '[ESTIMATION] No scale set - using annotation data only');
+    } else {
+      safeLog('estimationPipeline.log', '[ESTIMATION] No annotations - using defaults only');
+    }
+    
+    // Generate layout narrative from extracted data if LLM didn't provide one
+    if (!spatialNarrative || spatialNarrative.length < 200) {
+      spatialNarrative = generateLayoutNarrative(quantities, projectType, projectSpecificData);
+    }
+
+    // Create CSI scope with computed + inferred items
+    const csiScope = createCSIScope(computedCSIItems);
+
+    // ===================
+    // STEP 6: ASSEMBLE CLARIFICATION OUTPUT
+    // ===================
+    const estimateId = `est_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+    const {fixedOutput, finalValidation} = assembleClarificationOutput({estimateId,csiScope,quantities,
+      clarificationData,scopeText,planImageUrl,spaceModel,projectSpecificData,spatialNarrative,inferenceResult});
 
     // Save to Firestore (use set with merge to create if doesn't exist)
     // Note: db already initialized and user access verified at start of function
@@ -784,7 +809,7 @@ export const estimationPipeline = onCall({
       .collection('estimations').doc(sessionId)
       .set({
         clarificationOutput: fixedOutput, // Use validated and fixed output
-        status: finalValidation.isValid ? 'complete' : 'needs_review',
+        status: fixedOutput.clarificationStatus,
         validationScore: finalValidation.completenessScore,
         validationErrors: finalValidation.errors,
         validationWarnings: finalValidation.warnings,
@@ -795,10 +820,10 @@ export const estimationPipeline = onCall({
         createdAt: FieldValue.serverTimestamp(), // Will only be set on create due to merge
       }, { merge: true });
 
-    console.log(`[ESTIMATION] Complete. Generated estimate ${estimateId}`);
-    console.log(`[ESTIMATION] Used ${quantities.hasScale ? 'annotation-based' : 'pixel-only'} measurements`);
-    console.log(`[ESTIMATION] Wall length: ${quantities.totalWallLength} ${quantities.scaleUnit}`);
-    console.log(`[ESTIMATION] Floor area: ${quantities.totalFloorArea} sq ${quantities.scaleUnit}`);
+    safeLog('estimationPipeline.log', `[ESTIMATION] Complete. Generated estimate ${estimateId}`);
+    safeLog('estimationPipeline.log', `[ESTIMATION] Used ${quantities.hasScale ? 'annotation-based' : 'pixel-only'} measurements`);
+    safeLog('estimationPipeline.log', `[ESTIMATION] Wall length: ${quantities.totalWallLength} ${quantities.scaleUnit}`);
+    safeLog('estimationPipeline.log', `[ESTIMATION] Floor area: ${quantities.totalFloorArea} sq ${quantities.scaleUnit}`);
 
     return {
       success: true,
@@ -817,7 +842,7 @@ export const estimationPipeline = onCall({
       finishLevel,
     };
   } catch (error) {
-    console.error('Estimation Pipeline Error:', error);
+    safeLog('estimationPipeline.error', 'Estimation Pipeline Error:', error);
 
     if (error instanceof HttpsError) {
       throw error;
@@ -825,7 +850,7 @@ export const estimationPipeline = onCall({
 
     throw new HttpsError(
       'internal',
-      `Estimation failed: ${error instanceof Error ? error.message : String(error)}`
+      'Operation failed'
     );
   }
 });

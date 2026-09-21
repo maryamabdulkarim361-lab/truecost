@@ -36,6 +36,17 @@ from tests.fixtures.mock_cost_estimate_data import (
     get_cost_critic_a2a_request,
 )
 
+pytestmark = pytest.mark.usefixtures("block_network")
+
+
+@pytest.fixture(autouse=True)
+def offline_pricing(monkeypatch, mock_settings):
+    monkeypatch.setattr("services.llm_service.settings", mock_settings)
+    monkeypatch.setattr("services.cost_data_service._price_comparison_service", AsyncMock(return_value={}))
+    monkeypatch.setattr("agents.primary.cost_agent.get_serper_service", lambda: MagicMock(
+        search_home_depot_and_lowes=AsyncMock(return_value=None)
+    ))
+
 
 # =============================================================================
 # COST RANGE MODEL TESTS

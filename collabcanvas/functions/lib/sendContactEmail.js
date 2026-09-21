@@ -1,15 +1,17 @@
 "use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.sendContactEmail = void 0;
+const safeDiagnostics_1 = require("./safeDiagnostics");
+const functionSecurity_1 = require("./functionSecurity");
 /**
  * Cloud Function to send contact form emails
  * Uses Resend API to send to all team members
  */
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.sendContactEmail = void 0;
 const functions = require("firebase-functions");
 const resend_1 = require("resend");
 // CORS configuration
 const corsHeaders = {
-    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Origin': typeof (0, functionSecurity_1.allowedOrigins)()[0] === 'string' ? String((0, functionSecurity_1.allowedOrigins)()[0]) : '',
     'Access-Control-Allow-Methods': 'POST, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type',
 };
@@ -28,13 +30,21 @@ exports.sendContactEmail = functions
     secrets: ['RESEND_API_KEY'],
 })
     .https.onRequest(async (req, res) => {
+    try {
+        (0, functionSecurity_1.checkOrigin)(req.headers.origin);
+    }
+    catch (_a) {
+        res.status(403).json({ error: 'Origin not allowed' });
+        return;
+    }
+    const headers = Object.assign(Object.assign({}, corsHeaders), { 'Access-Control-Allow-Origin': req.headers.origin || '' });
     // Handle CORS preflight
     if (req.method === 'OPTIONS') {
-        res.set(corsHeaders);
+        res.set(headers);
         res.status(204).send('');
         return;
     }
-    res.set(corsHeaders);
+    res.set(headers);
     if (req.method !== 'POST') {
         res.status(405).json({ success: false, error: 'Method not allowed' });
         return;
@@ -52,7 +62,7 @@ exports.sendContactEmail = functions
         // Get Resend API key from Firebase secrets
         const resendApiKey = process.env.RESEND_API_KEY;
         if (!resendApiKey) {
-            console.error('RESEND_API_KEY secret not configured');
+            (0, safeDiagnostics_1.safeLog)('sendContactEmail.error', 'RESEND_API_KEY secret not configured');
             res.status(500).json({
                 success: false,
                 error: 'Email service not configured'
@@ -96,11 +106,11 @@ Sent from gettruecost.com contact form
             html: htmlContent,
             text: textContent,
         });
-        console.log('Contact email sent successfully to all team members', { from: email, subject });
+        (0, safeDiagnostics_1.safeLog)('sendContactEmail.log', 'Contact email sent successfully to all team members', { from: email, subject });
         res.status(200).json({ success: true, message: 'Email sent successfully' });
     }
     catch (error) {
-        console.error('Error sending contact email:', error);
+        (0, safeDiagnostics_1.safeLog)('sendContactEmail.error', 'Error sending contact email:', error);
         res.status(500).json({
             success: false,
             error: 'Failed to send email. Please try again later.'

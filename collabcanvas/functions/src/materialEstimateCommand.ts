@@ -1,4 +1,6 @@
-import { onCall, HttpsError } from 'firebase-functions/v2/https';
+import {safeLog, safeErrorMessage} from './safeDiagnostics';
+import { HttpsError } from 'firebase-functions/v2/https';
+import { onCall, allowedOrigins } from './functionSecurity';
 import { OpenAI } from 'openai';
 
 // Lazy initialization to avoid timeout during module load
@@ -8,7 +10,7 @@ function getOpenAI(): OpenAI {
   if (!_openai) {
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
-      console.error('[MATERIAL_ESTIMATE] OPENAI_API_KEY not configured');
+      safeLog('materialEstimateCommand.error', '[MATERIAL_ESTIMATE] OPENAI_API_KEY not configured');
       throw new Error('OPENAI_API_KEY not configured');
     }
     _openai = new OpenAI({ apiKey });
@@ -21,7 +23,7 @@ function getOpenAI(): OpenAI {
  * Uses OpenAI to parse natural language requests for construction material estimation
  */
 export const materialEstimateCommand = onCall({
-  cors: true, // Enable CORS for all origins
+  cors: allowedOrigins(), // Enable CORS for all origins
   maxInstances: 10,
   memory: '512MiB', // Increase memory for GPT-4o Vision
   secrets: ['OPENAI_API_KEY'], // Grant access to OpenAI API key secret
@@ -85,7 +87,7 @@ Return ONLY the JSON object with fields they specified, nothing else.`;
     // Parse the JSON response
     const specifications = JSON.parse(responseText);
     
-    console.log('🤖 OpenAI parsed specifications:', specifications);
+    safeLog('materialEstimateCommand.log', '🤖 OpenAI parsed specifications:', specifications);
 
     return {
       success: true,
@@ -95,7 +97,7 @@ Return ONLY the JSON object with fields they specified, nothing else.`;
     };
 
   } catch (error) {
-    console.error('Material Estimate AI Error:', error);
+    safeLog('materialEstimateCommand.error', 'Material Estimate AI Error:', error);
     
     if (error instanceof HttpsError) {
       throw error;
@@ -103,8 +105,8 @@ Return ONLY the JSON object with fields they specified, nothing else.`;
     
     return {
       success: false,
-      error: error instanceof Error ? error.message : String(error),
-      message: `Failed to parse request: ${error instanceof Error ? error.message : String(error)}`,
+      error: safeErrorMessage(error instanceof Error ? error.message : String(error)),
+      message: safeErrorMessage(`Failed to parse request: ${error instanceof Error ? error.message : String(error)}`),
     };
   }
 });
@@ -198,7 +200,7 @@ IMPORTANT: Count ALL doors including:
 
     const result = JSON.parse(responseText);
     
-    console.log('👁️ Vision AI analyzed plan:', result);
+    safeLog('materialEstimateCommand.log', '👁️ Vision AI analyzed plan:', result);
 
     return {
       success: true,
@@ -208,10 +210,10 @@ IMPORTANT: Count ALL doors including:
     };
 
   } catch (error) {
-    console.error('Vision query error:', error);
+    safeLog('materialEstimateCommand.error', 'Vision query error:', error);
     return {
       success: false,
-      error: error instanceof Error ? error.message : String(error),
+      error: safeErrorMessage(error instanceof Error ? error.message : String(error)),
       message: 'Failed to analyze plan image',
     };
   }

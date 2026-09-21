@@ -49,6 +49,8 @@ class CostBreakdownSummary(BaseModel):
     equipment: float = Field(default=0.0, ge=0, description="Total equipment costs")
     direct_costs_subtotal: float = Field(..., ge=0, description="Sum of direct costs")
     
+    location_adjustment: float = Field(default=0.0, description="Location adjustment to direct costs")
+
     # Markups
     overhead: float = Field(default=0.0, ge=0, description="Overhead amount")
     profit: float = Field(default=0.0, ge=0, description="Profit amount")
@@ -303,6 +305,7 @@ class FinalEstimate(BaseModel):
             },
             
             "costBreakdown": {
+                "locationAdjustment": self.cost_breakdown.location_adjustment,
                 "materials": self.cost_breakdown.materials,
                 "labor": self.cost_breakdown.labor,
                 "equipment": self.cost_breakdown.equipment,

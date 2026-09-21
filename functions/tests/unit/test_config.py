@@ -32,7 +32,7 @@ class TestSettings:
         # Test that settings attributes can be set
         settings.llm_model = "gpt-4-turbo"
         settings.llm_temperature = 0.5
-        settings.openai_api_key = "test-key"
+        settings._openai_api_key = "test-key"
         settings.pipeline_max_retries = 3
         settings.pipeline_passing_score = 85
         
@@ -53,12 +53,14 @@ class TestSettings:
         
         assert settings.is_emulator_mode is True
     
-    def test_validate_missing_api_key_in_production(self):
+    def test_validate_missing_api_key_in_production(self, monkeypatch):
         """Test validation fails without API key in production."""
         from config.settings import Settings
         
         settings = Settings()
-        settings.openai_api_key = None
+        settings.llm_provider = "openai"
+        monkeypatch.setattr("config.secrets.get_openai_api_key", lambda: None)
+        settings._openai_api_key = None
         settings.use_firebase_emulators = False
         
         with pytest.raises(ValueError, match="OPENAI_API_KEY is required"):

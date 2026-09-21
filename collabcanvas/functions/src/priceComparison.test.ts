@@ -24,6 +24,7 @@ vi.mock('firebase-admin/firestore', () => ({
 }));
 
 vi.mock('firebase-functions/v2/https', () => ({
+  onRequest: vi.fn((_config, handler) => handler),
   onCall: vi.fn((config, handler) => handler),
   HttpsError: class HttpsError extends Error {
     code: string;
@@ -469,11 +470,11 @@ describe('determineBestPrice', () => {
 // ============ FUNCTION CONFIGURATION TESTS ============
 
 describe('Cloud Function configuration', () => {
-  it('has CORS enabled for all origins', async () => {
+  it('restricts CORS to configured origins', async () => {
     // Import the actual function configuration to test it
     const { comparePricesConfig } = await import('./priceComparison');
-    // Should use cors: true to match other functions (aiCommand, materialEstimateCommand, sagemakerInvoke)
-    expect(comparePricesConfig.cors).toBe(true);
+    expect(Array.isArray(comparePricesConfig.cors)).toBe(true);
+    expect(comparePricesConfig.cors).not.toContain('*');
   });
 
   it('has correct timeout for 2nd gen functions', async () => {

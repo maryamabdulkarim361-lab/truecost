@@ -1,10 +1,7 @@
 "use strict";
-/**
- * Enhanced CSI Mapper
- * Maps computed quantities to comprehensive CSI divisions with intelligent inference
- */
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.buildEnhancedCSIItems = void 0;
+const safeDiagnostics_1 = require("./safeDiagnostics");
 // ===================
 // INTELLIGENT CSI MAPPING
 // ===================
@@ -49,7 +46,7 @@ function buildEnhancedCSIItems(quantities, context) {
     const doorStyle = ((_d = cc.details) === null || _d === void 0 ? void 0 : _d.doorStyle) || getFinishSpec(context.finishLevel, 'door');
     const flooringType = (_e = cc.details) === null || _e === void 0 ? void 0 : _e.flooringType;
     const paintType = ((_f = cc.details) === null || _f === void 0 ? void 0 : _f.paintType) || 'latex paint';
-    console.log('[CSI MAPPER] Clarification context applied:', {
+    (0, safeDiagnostics_1.safeLog)('enhancedCsiMapper.log', '[CSI MAPPER] Clarification context applied:', {
         exclusions: Object.keys(cc.exclusions || {}),
         inclusions: Object.keys(cc.inclusions || {}),
         demolitionArea,
@@ -163,7 +160,7 @@ function buildEnhancedCSIItems(quantities, context) {
         }
     }
     else {
-        console.log('[CSI MAPPER] Demolition excluded per clarification context');
+        (0, safeDiagnostics_1.safeLog)('enhancedCsiMapper.log', '[CSI MAPPER] Demolition excluded per clarification context');
     }
     // ===================
     // DIVISION 06 - WOOD, PLASTICS, COMPOSITES
@@ -450,7 +447,7 @@ function buildEnhancedCSIItems(quantities, context) {
             }
         }
         else {
-            console.log('[CSI MAPPER] Ceiling work excluded per clarification context');
+            (0, safeDiagnostics_1.safeLog)('enhancedCsiMapper.log', '[CSI MAPPER] Ceiling work excluded per clarification context');
         }
         // Tile for wet areas
         if (context.projectType.includes('kitchen') || context.projectType.includes('bathroom')) {
@@ -681,7 +678,7 @@ function buildEnhancedCSIItems(quantities, context) {
         }
     }
     else {
-        console.log('[CSI MAPPER] Plumbing work excluded per clarification context');
+        (0, safeDiagnostics_1.safeLog)('enhancedCsiMapper.log', '[CSI MAPPER] Plumbing work excluded per clarification context');
     }
     // ===================
     // DIVISION 23 - HVAC
@@ -702,7 +699,7 @@ function buildEnhancedCSIItems(quantities, context) {
         }
     }
     else {
-        console.log('[CSI MAPPER] HVAC work excluded per clarification context');
+        (0, safeDiagnostics_1.safeLog)('enhancedCsiMapper.log', '[CSI MAPPER] HVAC work excluded per clarification context');
     }
     // ===================
     // DIVISION 26 - ELECTRICAL
@@ -780,7 +777,7 @@ function buildEnhancedCSIItems(quantities, context) {
         }
     }
     else {
-        console.log('[CSI MAPPER] Electrical work excluded per clarification context');
+        (0, safeDiagnostics_1.safeLog)('enhancedCsiMapper.log', '[CSI MAPPER] Electrical work excluded per clarification context');
     }
     return items;
 }

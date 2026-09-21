@@ -3,10 +3,15 @@
 Provides CRUD operations for estimates and agent outputs.
 """
 
+from config.safe_logging import safe_error_text
+
 from typing import Dict, Any, Optional, List
 from datetime import datetime
 import inspect
+import time
 import structlog
+from google.api_core.exceptions import FailedPrecondition, Conflict, Aborted
+from services.cost_execution import bounded_storage_call
 
 from firebase_admin import firestore
 
@@ -37,20 +42,33 @@ class FirestoreService:
     AGENT_TO_STAGE_MAP = {
         "location": "location",
         "scope": "scope",
+        "code_compliance": "code_compliance",
         "cost": "cost",
         "risk": "risk",
-        "timeline": "risk",  # Timeline maps to risk stage for UI
+        "timeline": "timeline",
         "final": "final",
     }
     
-    def __init__(self, db=None):
+    def __init__(self, db=None, durable_context=None):
         """Initialize FirestoreService.
         
         Args:
             db: Optional Firestore client. If not provided, uses default.
         """
         self._db = db
+        self._durable = durable_context
     
+    async def _ensure_legacy_write(self, estimate_id):
+        """A durable estimate must never fall back to unbound legacy writes."""
+        from services.durable_execution import Rejected
+        if self._durable is not None:
+            raise Rejected('Unrouted durable write')
+        ref = self.db.collection(self.COLLECTION_ESTIMATES).document(estimate_id)
+        snapshot = await self._maybe_await(ref.get(retry=None, timeout=3))
+        data = snapshot.to_dict() if snapshot.exists else None
+        if isinstance(data, dict) and data.get('durableJobId'):
+            raise Rejected('Durable execution context required')
+
     @property
     def db(self):
         """Get Firestore client (lazy initialization)."""
@@ -63,6 +81,68 @@ class FirestoreService:
         if inspect.isawaitable(result):
             return await result
         return result
+
+    @staticmethod
+    def _cost_terminal(data):
+        terminal = {"failed", "completed", "complete", "error", "cancelled"}
+        return (data.get("status") in terminal or
+                data.get("pipelineStatus", {}).get("status") in terminal)
+
+    async def _mutate_cost(self, estimate_id, change):
+        """Optimistic atomic write: parent version fences output and item writes.
+
+        A batch precondition avoids an unbounded synchronous transaction. Each
+        RPC has a 3s timeout and no SDK retries; conflicts retry at most 3 times.
+        Cancellation joins in-flight IO before the request loop can close.
+        """
+        await self._ensure_legacy_write(estimate_id)
+        ref = self.db.collection(self.COLLECTION_ESTIMATES).document(estimate_id)
+        for _ in range(3):
+            snapshot = await bounded_storage_call(lambda: ref.get(retry=None, timeout=3.0))
+            if not snapshot.exists:
+                raise TrueCostError(ErrorCode.ESTIMATE_NOT_FOUND, "Cost estimate not found")
+            mutation = change(snapshot.to_dict())
+            if mutation is None:
+                return
+            updates, writes = mutation
+            batch = self.db.batch()
+            batch.update(ref, {**updates, "updatedAt": firestore.SERVER_TIMESTAMP},
+                         option=self.db.write_option(last_update_time=snapshot.update_time))
+            for doc_ref, data, merge in writes:
+                batch.set(doc_ref, data, merge=merge)
+            try:
+                await bounded_storage_call(lambda: batch.commit(retry=None, timeout=3.0))
+                return
+            except (FailedPrecondition, Conflict, Aborted):
+                continue
+        raise TrueCostError(ErrorCode.FIRESTORE_WRITE_FAILED, "Cost write conflicted with newer state")
+
+    async def begin_cost_attempt(self, estimate_id, attempt_id, expires_at):
+        def change(data):
+            if self._cost_terminal(data):
+                raise TrueCostError(ErrorCode.AGENT_FAILED, "Cannot start Cost on a terminal pipeline")
+            return {"costAttempt": {"id": attempt_id, "active": True,
+                                    "expiresAt": expires_at}}, []
+        await self._mutate_cost(estimate_id, change)
+
+    async def end_cost_attempt(self, estimate_id, attempt_id):
+        def change(data):
+            if data.get("costAttempt", {}).get("id") != attempt_id:
+                return None
+            return {"costAttempt.active": False}, []
+        await self._mutate_cost(estimate_id, change)
+
+    async def _write_cost_attempt(self, estimate_id, attempt_id, updates, writes=(), *, allow_inactive=False):
+        def change(data):
+            attempt = data.get("costAttempt")
+            valid = attempt is None and attempt_id is None  # Direct/offline callers
+            if attempt and attempt_id == attempt.get("id"):
+                valid = allow_inactive or (attempt.get("active") and
+                                          time.time() < attempt.get("expiresAt", 0))
+            if not valid or self._cost_terminal(data):
+                raise TrueCostError(ErrorCode.AGENT_FAILED, "Stale or abandoned Cost attempt")
+            return updates, writes
+        await self._mutate_cost(estimate_id, change)
     
     async def get_estimate(self, estimate_id: str) -> Optional[Dict[str, Any]]:
         """Fetch estimate document by ID.
@@ -85,10 +165,10 @@ class FirestoreService:
             return None
             
         except Exception as e:
-            logger.error("firestore_get_failed", estimate_id=estimate_id, error=str(e))
+            logger.error("firestore_get_failed", estimate_id=estimate_id, error=safe_error_text(e))
             raise TrueCostError(
                 code=ErrorCode.FIRESTORE_ERROR,
-                message=f"Failed to get estimate: {str(e)}",
+                message=f"Failed to get estimate: {safe_error_text(e)}",
                 details={"estimate_id": estimate_id}
             )
     
@@ -106,6 +186,10 @@ class FirestoreService:
         Raises:
             TrueCostError: If Firestore operation fails.
         """
+        if self._durable is not None:
+            return await self._durable.write(estimate_id, 'rootPatch', data)
+        await self._ensure_legacy_write(estimate_id)
+
         try:
             doc_ref = self.db.collection(self.COLLECTION_ESTIMATES).document(estimate_id)
             
@@ -116,10 +200,10 @@ class FirestoreService:
             logger.info("estimate_updated", estimate_id=estimate_id, fields=list(data.keys()))
             
         except Exception as e:
-            logger.error("firestore_update_failed", estimate_id=estimate_id, error=str(e))
+            logger.error("firestore_update_failed", estimate_id=estimate_id, error=safe_error_text(e))
             raise TrueCostError(
                 code=ErrorCode.FIRESTORE_WRITE_FAILED,
-                message=f"Failed to update estimate: {str(e)}",
+                message=f"Failed to update estimate: {safe_error_text(e)}",
                 details={"estimate_id": estimate_id}
             )
     
@@ -128,7 +212,8 @@ class FirestoreService:
         estimate_id: str,
         agent_name: str,
         status: str,
-        retry: Optional[int] = None
+        retry: Optional[int] = None,
+        attempt_id: Optional[str] = None,
     ) -> None:
         """Update pipeline status for an agent.
         
@@ -138,6 +223,11 @@ class FirestoreService:
             status: Status string (pending, running, completed, failed).
             retry: Optional retry attempt number.
         """
+        if self._durable is not None:
+            return await self._durable.write(estimate_id, 'agentStatus',
+                {'status': status, 'retry': retry}, agent_name=agent_name, attempt_id=attempt_id)
+        await self._ensure_legacy_write(estimate_id)
+
         update_data = {
             f"pipelineStatus.agentStatuses.{agent_name}": status,
             "pipelineStatus.currentAgent": agent_name,
@@ -147,7 +237,10 @@ class FirestoreService:
         if retry is not None:
             update_data[f"pipelineStatus.retries.{agent_name}"] = retry
         
-        await self.update_estimate(estimate_id, update_data)
+        if agent_name == "cost":
+            await self._write_cost_attempt(estimate_id, attempt_id, update_data)
+        else:
+            await self.update_estimate(estimate_id, update_data)
         logger.info("agent_status_updated", estimate_id=estimate_id, agent=agent_name, status=status)
 
     async def sync_to_project_pipeline(
@@ -179,6 +272,8 @@ class FirestoreService:
             user_id: User who triggered the pipeline.
             started_at: Pipeline start timestamp (ms since epoch).
         """
+        await self._ensure_legacy_write(estimate_id)
+
         if not project_id:
             logger.warning("sync_skipped_no_project_id", estimate_id=estimate_id)
             return
@@ -241,7 +336,7 @@ class FirestoreService:
                 "project_pipeline_sync_failed",
                 project_id=project_id,
                 estimate_id=estimate_id,
-                error=str(e),
+                error=safe_error_text(e),
             )
 
     async def save_agent_output(
@@ -253,7 +348,9 @@ class FirestoreService:
         confidence: Optional[float] = None,
         tokens_used: Optional[int] = None,
         duration_ms: Optional[int] = None,
-        score: Optional[int] = None
+        score: Optional[int] = None,
+        attempt_id: Optional[str] = None,
+        allow_inactive: bool = False,
     ) -> None:
         """Save agent output to subcollection.
         
@@ -270,6 +367,11 @@ class FirestoreService:
         Raises:
             TrueCostError: If Firestore operation fails.
         """
+        if self._durable is not None:
+            return await self._durable.write(estimate_id, 'output', output,
+                agent_name=agent_name, attempt_id=attempt_id)
+        await self._ensure_legacy_write(estimate_id)
+
         try:
             doc_ref = (
                 self.db
@@ -293,6 +395,15 @@ class FirestoreService:
             
             # Remove None values
             agent_output_data = {k: v for k, v in agent_output_data.items() if v is not None}
+
+            if agent_name == "cost":
+                await self._write_cost_attempt(
+                    estimate_id, attempt_id,
+                    {"costOutput": output, "pipelineStatus.agentStatuses.cost": "completed"},
+                    [(doc_ref, agent_output_data, False)],
+                    allow_inactive=allow_inactive,
+                )
+                return
             
             await self._maybe_await(doc_ref.set(agent_output_data))
             
@@ -315,18 +426,19 @@ class FirestoreService:
                 "agent_output_save_failed",
                 estimate_id=estimate_id,
                 agent=agent_name,
-                error=str(e)
+                error=safe_error_text(e)
             )
             raise TrueCostError(
                 code=ErrorCode.FIRESTORE_WRITE_FAILED,
-                message=f"Failed to save agent output: {str(e)}",
+                message=f"Failed to save agent output: {safe_error_text(e)}",
                 details={"estimate_id": estimate_id, "agent_name": agent_name}
             )
 
     async def save_cost_items(
         self,
         estimate_id: str,
-        items: List[Dict[str, Any]]
+        items: List[Dict[str, Any]],
+        attempt_id: Optional[str] = None,
     ) -> int:
         """Save granular cost items to a dedicated subcollection.
 
@@ -345,6 +457,11 @@ class FirestoreService:
         Returns:
             Number of items written.
         """
+        if self._durable is not None:
+            await self._durable.write(estimate_id, 'costItems', items, attempt_id=attempt_id)
+            return sum(isinstance(item, dict) for item in items)
+        await self._ensure_legacy_write(estimate_id)
+
         if not items:
             return 0
 
@@ -356,7 +473,7 @@ class FirestoreService:
                 .collection(self.SUBCOLLECTION_COST_ITEMS)
             )
 
-            batch = self.db.batch()
+            writes = []
             written = 0
 
             for item in items:
@@ -371,18 +488,18 @@ class FirestoreService:
                 if "createdAt" not in data:
                     data["createdAt"] = firestore.SERVER_TIMESTAMP
 
-                batch.set(doc_ref, data, merge=True)
+                writes.append((doc_ref, data, True))
                 written += 1
 
             if written:
-                await self._maybe_await(batch.commit())
+                await self._write_cost_attempt(estimate_id, attempt_id, {}, writes)
 
             return written
         except Exception as e:
-            logger.error("cost_items_save_failed", estimate_id=estimate_id, error=str(e))
+            logger.error("cost_items_save_failed", estimate_id=estimate_id, error=safe_error_text(e))
             raise TrueCostError(
                 code=ErrorCode.FIRESTORE_WRITE_FAILED,
-                message=f"Failed to save cost items: {str(e)}",
+                message=f"Failed to save cost items: {safe_error_text(e)}",
                 details={"estimate_id": estimate_id}
             )
 
@@ -400,6 +517,9 @@ class FirestoreService:
         Returns:
             List of cost item documents (each includes "id").
         """
+        if self._durable is not None:
+            return await self._durable.list_cost_items(estimate_id, limit)
+
         try:
             coll_ref = (
                 self.db
@@ -418,7 +538,7 @@ class FirestoreService:
                 results.append({"id": doc.id, **(doc.to_dict() or {})})
             return results
         except Exception as e:
-            logger.error("cost_items_list_failed", estimate_id=estimate_id, error=str(e))
+            logger.error("cost_items_list_failed", estimate_id=estimate_id, error=safe_error_text(e))
             return []
     
     async def get_agent_output(
@@ -454,7 +574,7 @@ class FirestoreService:
                 "agent_output_get_failed",
                 estimate_id=estimate_id,
                 agent=agent_name,
-                error=str(e)
+                error=safe_error_text(e)
             )
             return None
     
@@ -467,6 +587,8 @@ class FirestoreService:
         Raises:
             TrueCostError: If Firestore operation fails.
         """
+        await self._ensure_legacy_write(estimate_id)
+
         try:
             estimate_ref = self.db.collection(self.COLLECTION_ESTIMATES).document(estimate_id)
             
@@ -490,10 +612,10 @@ class FirestoreService:
             logger.info("estimate_deleted", estimate_id=estimate_id)
             
         except Exception as e:
-            logger.error("estimate_delete_failed", estimate_id=estimate_id, error=str(e))
+            logger.error("estimate_delete_failed", estimate_id=estimate_id, error=safe_error_text(e))
             raise TrueCostError(
                 code=ErrorCode.FIRESTORE_ERROR,
-                message=f"Failed to delete estimate: {str(e)}",
+                message=f"Failed to delete estimate: {safe_error_text(e)}",
                 details={"estimate_id": estimate_id}
             )
     
@@ -501,7 +623,8 @@ class FirestoreService:
         self,
         estimate_id: str,
         user_id: str,
-        clarification_output: Dict[str, Any]
+        clarification_output: Dict[str, Any],
+        create_only: bool = False
     ) -> str:
         """Create a new estimate document.
         
@@ -513,6 +636,8 @@ class FirestoreService:
         Returns:
             The created estimate ID.
         """
+        await self._ensure_legacy_write(estimate_id)
+
         try:
             doc_ref = self.db.collection(self.COLLECTION_ESTIMATES).document(estimate_id)
             
@@ -532,15 +657,15 @@ class FirestoreService:
                 "updatedAt": firestore.SERVER_TIMESTAMP
             }
             
-            await self._maybe_await(doc_ref.set(estimate_data))
+            await self._maybe_await(doc_ref.create(estimate_data) if create_only else doc_ref.set(estimate_data))
             logger.info("estimate_created", estimate_id=estimate_id, user_id=user_id)
             
             return estimate_id
             
         except Exception as e:
-            logger.error("estimate_create_failed", estimate_id=estimate_id, error=str(e))
+            logger.error("estimate_create_failed", estimate_id=estimate_id, error=safe_error_text(e))
             raise TrueCostError(
                 code=ErrorCode.FIRESTORE_WRITE_FAILED,
-                message=f"Failed to create estimate: {str(e)}",
+                message=f"Failed to create estimate: {safe_error_text(e)}",
                 details={"estimate_id": estimate_id}
             )

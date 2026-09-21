@@ -1,3 +1,4 @@
+import {safeLog} from './safeDiagnostics';
 /**
  * Enhanced LLM Inference Module
  * Improved prompts and structured output for better JSON accuracy
@@ -279,7 +280,7 @@ export async function runEnhancedInference(
     // Validate and fix the response
     return validateAndFixInferenceResult(parsed);
   } catch (error) {
-    console.error('[ENHANCED_INFERENCE] Error:', error);
+    safeLog('enhancedInference.error', '[ENHANCED_INFERENCE] Error:', error);
     return getDefaultInferenceResult();
   }
 }

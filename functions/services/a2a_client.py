@@ -15,7 +15,8 @@ import httpx
 # which can shadow the `config.settings` *module* in some import patterns.
 # Use importlib to ensure we always reference the actual module.
 settings_module = importlib.import_module("config.settings")
-from config.errors import A2AError, ErrorCode
+from config.errors import A2AError, ErrorCode, StructuredError
+from config.production import is_production, require_https_url
 
 logger = structlog.get_logger()
 
@@ -41,7 +42,19 @@ class A2AClient:
 
         self.base_url = base_url or default_base_url
         self.timeout = timeout or default_timeout
+        if is_production():
+            require_https_url(self.base_url, "A2A_BASE_URL")
     
+    async def _identity_headers(self, endpoint: str) -> dict:
+        if not is_production():
+            return {}
+        # Platform verifies the ADC identity and exact function URL audience.
+        # No token is logged, stored, or replaced with an anonymous fallback.
+        from google.auth.transport.requests import Request
+        from google.oauth2.id_token import fetch_id_token
+        token = await asyncio.to_thread(fetch_id_token, Request(), endpoint)
+        return {"Authorization": f"Bearer {token}"}
+
     def _create_request_id(self) -> str:
         """Generate unique request ID."""
         return str(uuid4())
@@ -117,14 +130,16 @@ class A2AClient:
             target_agent=target_agent,
             request_id=request_id,
             thread_id=thread_id,
-            endpoint=endpoint
+            transport="private-service" if is_production() else "local"
         )
         
         try:
+            headers = await self._identity_headers(endpoint)
             async with httpx.AsyncClient() as client:
                 response = await client.post(
                     endpoint,
                     json=payload,
+                    headers=headers,
                     timeout=float(self.timeout)
                 )
                 
@@ -159,13 +174,13 @@ class A2AClient:
                 "a2a_connection_error",
                 target_agent=target_agent,
                 request_id=request_id,
-                error=str(e)
+                error="A2A transport failure"
             )
             raise A2AError(
                 code=ErrorCode.A2A_CONNECTION_ERROR,
                 message=f"Failed to connect to {target_agent}",
                 target_agent=target_agent,
-                details={"request_id": request_id, "error": str(e)}
+                details={"request_id": request_id, "error": "A2A transport failure"}
             )
             
         except httpx.HTTPStatusError as e:
@@ -174,7 +189,7 @@ class A2AClient:
                 target_agent=target_agent,
                 request_id=request_id,
                 status_code=e.response.status_code,
-                error=str(e)
+                error="A2A transport failure"
             )
             raise A2AError(
                 code=ErrorCode.A2A_INVALID_RESPONSE,
@@ -191,13 +206,13 @@ class A2AClient:
                 "a2a_error",
                 target_agent=target_agent,
                 request_id=request_id,
-                error=str(e)
+                error="A2A transport failure"
             )
             raise A2AError(
                 code=ErrorCode.A2A_CONNECTION_ERROR,
-                message=f"A2A communication error: {str(e)}",
+                message="A2A communication failed",
                 target_agent=target_agent,
-                details={"request_id": request_id, "error": str(e)}
+                details={"request_id": request_id, "error": "A2A transport failure"}
             )
     
     async def get_task_status(
@@ -225,10 +240,12 @@ class A2AClient:
         endpoint = f"{self.base_url}/a2a_{target_agent}"
         
         try:
+            headers = await self._identity_headers(endpoint)
             async with httpx.AsyncClient() as client:
                 response = await client.post(
                     endpoint,
                     json=payload,
+                    headers=headers,
                     timeout=30.0  # Shorter timeout for status checks
                 )
                 response.raise_for_status()
@@ -239,11 +256,11 @@ class A2AClient:
                 "a2a_get_status_error",
                 target_agent=target_agent,
                 task_id=task_id,
-                error=str(e)
+                error="A2A transport failure"
             )
             raise A2AError(
                 code=ErrorCode.A2A_CONNECTION_ERROR,
-                message=f"Failed to get task status: {str(e)}",
+                message="Failed to get task status",
                 target_agent=target_agent,
                 details={"task_id": task_id}
             )
@@ -314,6 +331,8 @@ class A2AClient:
         status = result.get("status")
         
         if status == "failed":
+            if isinstance(result.get("error"), dict):
+                raise StructuredError.from_dict(result["error"])
             raise A2AError(
                 code=ErrorCode.AGENT_FAILED,
                 message=result.get("error", "Agent task failed"),
@@ -322,6 +341,5 @@ class A2AClient:
             )
         
         return result.get("result", {})
-
 
 

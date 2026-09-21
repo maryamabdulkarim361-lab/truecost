@@ -4,6 +4,8 @@ Custom exceptions and error codes for the deep agent pipeline.
 """
 
 from typing import Optional, Dict, Any
+import math
+import re
 
 
 # Error Codes
@@ -42,6 +44,13 @@ class ErrorCode:
     LLM_ERROR = "LLM_ERROR"
     LLM_RATE_LIMIT = "LLM_RATE_LIMIT"
     LLM_CONTEXT_TOO_LONG = "LLM_CONTEXT_TOO_LONG"
+    INSUFFICIENT_DATA = "INSUFFICIENT_DATA"
+    LLM_QUOTA_EXCEEDED = "LLM_QUOTA_EXCEEDED"
+    LLM_RATE_LIMITED = "LLM_RATE_LIMITED"
+    LLM_AUTH_ERROR = "LLM_AUTH_ERROR"
+    LLM_TIMEOUT = "LLM_TIMEOUT"
+    LLM_PROVIDER_ERROR = "LLM_PROVIDER_ERROR"
+    LLM_INVALID_RESPONSE = "LLM_INVALID_RESPONSE"
     
     # External Service Errors (7xxx)
     EXTERNAL_API_ERROR = "EXTERNAL_API_ERROR"
@@ -92,6 +101,70 @@ class TrueCostError(Exception):
     
     def __repr__(self) -> str:
         return f"TrueCostError(code={self.code!r}, message={self.message!r})"
+
+
+class StructuredError(TrueCostError):
+    """Allowlisted execution failure safe to send through A2A and persist.
+
+    Never accept upstream exception messages, bodies, headers, or URLs here.
+    """
+
+    MESSAGES = {
+        ErrorCode.INSUFFICIENT_DATA: "Required project inputs are missing or unusable",
+        ErrorCode.LLM_QUOTA_EXCEEDED: "LLM provider quota exhausted",
+        ErrorCode.LLM_RATE_LIMITED: "LLM provider rate limit exceeded",
+        ErrorCode.LLM_AUTH_ERROR: "LLM provider authentication or authorization failed",
+        ErrorCode.LLM_TIMEOUT: "LLM provider request timed out",
+        ErrorCode.LLM_PROVIDER_ERROR: "LLM provider request failed",
+        ErrorCode.LLM_INVALID_RESPONSE: "LLM response is invalid",
+        ErrorCode.LLM_CONTEXT_TOO_LONG: "Input too long for model context",
+    }
+
+    REASONS = frozenset({
+        "empty_response", "invalid_json_type", "invalid_json", "invalid_type", "tasks_missing", "tasks_empty", "missing",
+        "null", "out_of_range", "invalid", "blank", "duplicate",
+        "unknown_task", "self_dependency", "insufficient_scheduling_information",
+        "conflicting_state", "transport_error", "provider_http_error", "validation_budget_blocked",
+        "client_lifecycle_error", "response_processing_error", "unclassified_error",
+    })
+
+    STAGES = frozenset({"client_initialization", "provider_request", "provider_response",
+                        "response_processing", "timeline_prompt_construction",
+                        "timeline_processing", "unknown"})
+
+    def __init__(self, code, *, provider=None, model=None, http_status=None, retry_delay=None,
+                 reason=None, field_path=None, failure_stage=None, completion_status=None):
+        if code not in self.MESSAGES:
+            code = ErrorCode.LLM_PROVIDER_ERROR
+        details = {"retryable": code == ErrorCode.LLM_RATE_LIMITED}
+        if provider in ("gemini", "openai"):
+            details["provider"] = provider
+        if isinstance(model, str) and re.fullmatch(r"(?:gemini-|gpt-|o[134](?:-|$))[a-zA-Z0-9_.:-]*", model):
+            details["model"] = model
+        if type(http_status) is int and 400 <= http_status <= 599:
+            details["http_status"] = http_status
+        if (type(retry_delay) in (int, float) and math.isfinite(retry_delay)
+                and 0 <= retry_delay <= 86400):
+            details["retry_delay"] = float(retry_delay)
+        if completion_status in ("stop", "length", "content_filter", "tool_calls", "function_call"):
+            details["completion_status"] = completion_status
+        if isinstance(failure_stage, str) and failure_stage in self.STAGES:
+            details["failure_stage"] = failure_stage
+        if isinstance(reason, str) and reason in self.REASONS:
+            details["reason"] = reason
+        if isinstance(field_path, str) and re.fullmatch(
+            r"(?:response|status|tasks(?:\[[0-9]{1,6}\](?:\.(?:name|phase|duration_days|primary_trade|depends_on))?)?)",
+            field_path,
+        ):
+            details["field_path"] = field_path
+        super().__init__(code, self.MESSAGES[code], details)
+
+    @classmethod
+    def from_dict(cls, payload):
+        details = payload.get("details")
+        details = details if isinstance(details, dict) else {}
+        return cls(payload.get("code"), **{k: details.get(k) for k in
+                   ("provider", "model", "http_status", "retry_delay", "reason", "field_path", "failure_stage", "completion_status")})
 
 
 class ValidationError(TrueCostError):
@@ -163,6 +236,4 @@ class A2AError(TrueCostError):
             details={**(details or {}), "target_agent": target_agent}
         )
         self.target_agent = target_agent
-
-
 

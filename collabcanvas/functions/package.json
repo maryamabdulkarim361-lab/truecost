@@ -25,7 +25,8 @@
     "nodemailer": "^6.9.16",
     "openai": "^6.10.0",
     "resend": "^6.6.0",
-    "zod": "^3.22.0"
+    "zod": "^3.22.0",
+    "google-auth-library": "9.15.1"
   },
   "devDependencies": {
     "@types/nodemailer": "^6.4.17",

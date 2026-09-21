@@ -8,9 +8,13 @@ PR #6 Addition: Material cost and labor rate lookups with P50/P80/P90 ranges.
 
 from __future__ import annotations
 
+from config.safe_logging import safe_error_text
+
 from typing import Dict, List, Optional, Tuple, Any
 import re
 import structlog
+from config.settings import settings
+from services.cost_execution import PriceEnrichmentBudget
 
 from models.cost_estimate import CostRange, CostConfidenceLevel
 from models.bill_of_quantities import TradeCategory
@@ -454,7 +458,16 @@ class CostDataService:
     def __init__(self):
         """Initialize CostDataService."""
         self._cache: Dict[str, LocationLocationFactors] = {}
+        self.begin_pricing_attempt(PriceEnrichmentBudget(settings.price_enrichment_budget_seconds))
         logger.info("cost_data_service_initialized", mock=True)
+
+    def begin_pricing_attempt(self, budget):
+        self.price_budget = budget
+        self._price_cache = {}
+        self._batch_priced_projects = set()
+
+    async def _lookup_prices(self, price_service, **kwargs):
+        return await self.price_budget.run(lambda: price_service(**kwargs)) or {}
     
     async def get_location_factors(self, zip_code: str) -> LocationLocationFactors:
         """Get location factors for a ZIP code.
@@ -804,7 +817,8 @@ class CostDataService:
                         )
                     
                     # Call price comparison service
-                    prices = await price_service(
+                    prices = {} if project_id in self._batch_priced_projects else await self._lookup_prices(
+                        price_service,
                         product_names=[item_description],
                         project_id=project_id,
                         zip_code=zip_code,
@@ -837,7 +851,7 @@ class CostDataService:
                     "price_comparison_failed",
                     product=item_description[:50] if item_description else None,
                     project_id=project_id,
-                    error=str(e)
+                    error=safe_error_text(e)
                 )
                 # Fall through to hardcoded costs
         
@@ -884,6 +898,11 @@ class CostDataService:
         """
         if not product_descriptions or not project_id:
             return
+        # A batch is the only comparison attempt for this project in this run,
+        # including unavailable services and partial/missing results.
+        if project_id in self._batch_priced_projects:
+            return
+        self._batch_priced_projects.add(project_id)
         
         try:
             price_service = _get_price_comparison_service()
@@ -914,7 +933,8 @@ class CostDataService:
                 )
                 
                 # Call price comparison service with all products at once
-                prices = await price_service(
+                prices = await self._lookup_prices(
+                    price_service,
                     product_names=uncached_products,
                     project_id=project_id,
                     zip_code=zip_code,
@@ -936,7 +956,7 @@ class CostDataService:
                 "batch_prefetch_prices_failed",
                 project_id=project_id,
                 product_count=len(product_descriptions),
-                error=str(e)
+                error=safe_error_text(e)
             )
             # Non-fatal - individual calls will still work with fallback
     
@@ -1131,7 +1151,7 @@ class CostDataService:
                 logger.warning(
                     "labor_rate_location_lookup_failed",
                     zip_code=zip_code,
-                    error=str(e)
+                    error=safe_error_text(e)
                 )
         
         # Labor rate variance is typically lower than material variance
@@ -3121,7 +3141,7 @@ async def _lookup_firestore(zip_code: str) -> Optional[Dict]:
         logger.error(
             "firestore_lookup_failed",
             zip_code=zip_code,
-            error=str(e),
+            error=safe_error_text(e),
         )
         return None
 
@@ -3337,7 +3357,7 @@ async def _lookup_material_firestore(item_code: str) -> Optional[Dict]:
         logger.error(
             "firestore_material_lookup_failed",
             item_code=item_code,
-            error=str(e),
+            error=safe_error_text(e),
         )
         return None
 

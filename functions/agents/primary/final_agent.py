@@ -4,11 +4,15 @@ Synthesizes all previous agent outputs into a comprehensive
 final estimate with executive summary.
 """
 
+from config.safe_logging import safe_error_text
+
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 import time
+import math
 import structlog
 
+from config.errors import ValidationError
 from agents.base_agent import BaseA2AAgent
 from services.firestore_service import FirestoreService
 from services.llm_service import LLMService
@@ -131,6 +135,8 @@ class FinalAgent(BaseA2AAgent):
             has_feedback=feedback is not None
         )
         
+        self._validate_handoff(estimate_id, input_data)
+
         # Extract all previous outputs
         clarification = input_data.get("clarification_output", {})
         location_output = input_data.get("location_output", {})
@@ -252,6 +258,10 @@ class FinalAgent(BaseA2AAgent):
         
         # Add status update flag
         output["estimateComplete"] = True
+        output.update(baseEstimate=cost_breakdown.total_before_contingency,
+                      contingency=cost_breakdown.contingency,
+                      finalEstimate=cost_breakdown.total_with_contingency,
+                      totalCost=cost_breakdown.total_with_contingency)
 
         # Load granular cost ledger (written by CostAgent) and attach lightweight metadata.
         # We keep the full list in a subcollection to avoid Firestore document size limits.
@@ -276,7 +286,7 @@ class FinalAgent(BaseA2AAgent):
         try:
             await self.firestore.update_estimate(estimate_id, integration_payload)
         except Exception as e:
-            logger.warning("integration_payload_update_failed", estimate_id=estimate_id, error=str(e))
+            logger.warning("integration_payload_update_failed", estimate_id=estimate_id, error=safe_error_text(e))
         
         # Calculate overall confidence
         confidence = min(0.95, data_completeness + 0.1)
@@ -303,6 +313,53 @@ class FinalAgent(BaseA2AAgent):
         
         return output
     
+    @staticmethod
+    def _validate_handoff(estimate_id, inputs):
+        """Reject invalid supplied data without making optional sections required."""
+        def invalid():
+            raise ValidationError("Invalid Final Agent input")
+
+        def finite(value):
+            if isinstance(value, float) and not math.isfinite(value):
+                invalid()
+            if isinstance(value, dict):
+                for item in value.values():
+                    finite(item)
+            elif isinstance(value, list):
+                for item in value:
+                    finite(item)
+
+        if not isinstance(estimate_id, str) or not estimate_id.strip() or not isinstance(inputs, dict):
+            invalid()
+        finite(inputs)
+        for key in ("clarification_output", "location_output", "scope_output",
+                    "cost_output", "risk_output", "timeline_output", "code_compliance_output"):
+            if key in inputs and not isinstance(inputs[key], dict):
+                invalid()
+        for section, field, keys in (("cost_output", "total", ("low", "medium", "high")),
+                                      ("risk_output", "monteCarlo", ("p50", "p80", "p90"))):
+            values = inputs.get(section, {}).get(field, {})
+            if not isinstance(values, dict):
+                invalid()
+            present = [values[k] for k in keys if k in values]
+            if any(type(v) not in (int, float) or v < 0 for v in present):
+                invalid()
+            if present != sorted(present):
+                invalid()
+        timeline = inputs.get("timeline_output", {})
+        if timeline:
+            tasks = timeline.get("tasks")
+            if not isinstance(tasks, list) or not tasks:
+                invalid()
+            ids = set()
+            for task in tasks:
+                if not isinstance(task, dict):
+                    invalid()
+                identity = task.get("id")
+                if not isinstance(identity, str) or not identity.strip() or identity in ids:
+                    invalid()
+                ids.add(identity)
+
     def _build_cost_breakdown(
         self,
         cost_output: Dict[str, Any],
@@ -343,6 +400,13 @@ class FinalAgent(BaseA2AAgent):
         # Calculate direct costs subtotal
         direct_costs = material_cost + labor_cost + equipment_cost
         
+        # Preserve the deterministic location adjustment; Cost contingency is
+        # deliberately excluded here and replaced once by the selected allowance.
+        location_subtotal = adjustments.get("locationAdjustedSubtotal", {})
+        adjusted_direct = (location_subtotal.get("low", direct_costs)
+                           if isinstance(location_subtotal, dict) else direct_costs)
+        location_adjustment = adjusted_direct - direct_costs
+
         # Get overhead and profit
         overhead = adjustments.get("overhead", {})
         if isinstance(overhead, dict):
@@ -411,13 +475,14 @@ class FinalAgent(BaseA2AAgent):
         
         # Calculate totals
         total_before_contingency = (
-            direct_costs + overhead_amount + profit_amount + permit_cost + tax_amount
+            adjusted_direct + overhead_amount + profit_amount + permit_cost + tax_amount
         )
         if user_contingency_pct is not None:
             contingency_amount = total_before_contingency * user_contingency_pct
         total_with_contingency = total_before_contingency + contingency_amount
         
         return CostBreakdownSummary(
+            location_adjustment=round(location_adjustment, 2),
             materials=round(material_cost, 2),
             labor=round(labor_cost, 2),
             equipment=round(equipment_cost, 2),
@@ -626,7 +691,7 @@ class FinalAgent(BaseA2AAgent):
             return response.get("content", {})
             
         except Exception as e:
-            logger.warning("llm_analysis_failed", error=str(e))
+            logger.warning("llm_analysis_failed", error=safe_error_text(e))
             return self._generate_default_analysis()
     
     def _build_llm_prompt(
@@ -869,9 +934,8 @@ Please provide recommendations in the required JSON format."""
             project_name = f"{proj_type_label} - {city}" if city else proj_type_label
 
         total = cost_output.get("total", {}) or {}
-        p50 = total.get("low", 0)
-        p80 = total.get("medium", p50 * 1.15 if p50 else 0)
-        p90 = total.get("high", p80 * 1.1 if p80 else 0)
+        confidence_range = self._build_confidence_range(risk_output, cost_output)
+        p50, p80, p90 = confidence_range.p50, confidence_range.p80, confidence_range.p90
 
         contingency_pct = risk_output.get("contingency", {}).get("recommended")
         if contingency_pct is None:
@@ -882,11 +946,12 @@ Please provide recommendations in the required JSON format."""
         timeline_days = timeline_output.get("totalDuration", 30)
         timeline_weeks = round(timeline_days / 5, 1)
 
-        cost_drivers = self._build_cost_drivers(cost_output, total_cost=p50)
+        authoritative = self._build_cost_breakdown(cost_output, risk_output, clarification)
+        cost_drivers = self._build_cost_drivers(cost_output, total_cost=authoritative.total_with_contingency)
         risk_analysis = self._build_risk_analysis(monte_carlo, contingency_pct, risk_output)
         schedule = self._build_schedule(timeline_output, timeline_weeks)
-        labor_analysis = self._build_labor_analysis(cost_output, total_cost=p50)
-        cost_breakdown = self._build_cost_breakdown_for_spec(cost_output, total_cost=p50)
+        labor_analysis = self._build_labor_analysis(cost_output, total_cost=authoritative.total_with_contingency)
+        cost_breakdown = self._build_cost_breakdown_for_spec(cost_output, total_cost=authoritative.total_with_contingency)
         boq = self._build_boq(scope_output)
         assumptions = self._build_assumptions(clarification, risk_output)
 
@@ -896,11 +961,14 @@ Please provide recommendations in the required JSON format."""
             "projectType": project_type,
             "scope": scope_desc,
             "squareFootage": sqft,
-            "totalCost": p50,
+            "baseEstimate": authoritative.total_before_contingency,
+            "contingency": authoritative.contingency,
+            "finalEstimate": authoritative.total_with_contingency,
+            "totalCost": authoritative.total_with_contingency,
             "p50": p50,
             "p80": p80,
             "p90": p90,
-            "contingencyPct": contingency_pct,
+            "contingencyPct": authoritative.contingency_percentage,
             "timelineWeeks": timeline_weeks,
             "monteCarloIterations": iterations,
             "costDrivers": cost_drivers,
@@ -931,12 +999,12 @@ Please provide recommendations in the required JSON format."""
         drivers = []
         for d in divisions:
             total = 0
-            if isinstance(d.get("total"), dict):
-                total = d["total"].get("low", 0)
+            if isinstance(d.get("divisionTotal", d.get("total")), dict):
+                total = d.get("divisionTotal", d.get("total")).get("low", 0)
             elif isinstance(d.get("total"), (int, float)):
                 total = d["total"]
             drivers.append({
-                "name": d.get("name") or d.get("code") or "Unknown",
+                "name": d.get("divisionName") or d.get("name") or d.get("divisionCode") or d.get("code") or "Unknown",
                 "cost": round(total, 2),
                 "percentage": round((total / total_cost * 100), 1) if total_cost else None
             })
@@ -983,9 +1051,9 @@ Please provide recommendations in the required JSON format."""
                 "number": t.get("id") or idx,
                 "name": t.get("name", ""),
                 "duration": t.get("durationDays", t.get("duration", "")),
-                "start": t.get("startDate", ""),
-                "end": t.get("endDate", ""),
-                "is_milestone": t.get("isCritical", False) or (t.get("id") in milestone_ids),
+                "start": t.get("start", t.get("startDate", "")),
+                "end": t.get("end", t.get("endDate", "")),
+                "is_milestone": t.get("isMilestone", False) or (t.get("id") in milestone_ids),
                 "dependencies": t.get("dependencies", [])
             })
         notes = timeline_output.get("notes", [])
@@ -1098,7 +1166,8 @@ Please provide recommendations in the required JSON format."""
         subtotals = cost_output.get("subtotals", {}) or {}
         materials = subtotals.get("materials", {})
         labor = subtotals.get("labor", {})
-        permits = subtotals.get("permits", subtotals.get("permitCosts", {}))
+        permits = cost_output.get("adjustments", {}).get("permitCosts",
+            subtotals.get("permits", subtotals.get("permitCosts", {})))
 
         def _val(x):
             if isinstance(x, dict):
@@ -1114,9 +1183,9 @@ Please provide recommendations in the required JSON format."""
 
         divisions_out = []
         for d in cost_output.get("divisions", []) or []:
-            total = _val(d.get("total"))
-            material_sub = _val(d.get("materials"))
-            labor_sub = _val(d.get("labor"))
+            total = _val(d.get("divisionTotal", d.get("total")))
+            material_sub = _val(d.get("materialSubtotal", d.get("materials")))
+            labor_sub = _val(d.get("laborSubtotal", d.get("labor")))
             items = []
             for li in d.get("lineItems", d.get("line_items", [])):
                 items.append({
@@ -1128,8 +1197,8 @@ Please provide recommendations in the required JSON format."""
                     "labor_cost": _val(li.get("laborCost"))
                 })
             divisions_out.append({
-                "code": d.get("code", ""),
-                "name": d.get("name", ""),
+                "code": d.get("divisionCode", d.get("code", "")),
+                "name": d.get("divisionName", d.get("name", "")),
                 "total": total,
                 "material_subtotal": material_sub,
                 "labor_subtotal": labor_sub,

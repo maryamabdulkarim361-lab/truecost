@@ -1,3 +1,5 @@
+> Monetary mapping update: [Authoritative Cost Contract V1](../setup/authoritative-cost-contract.md) supersedes the historical P50/P80-as-total mappings below.
+
 # Story 4.3: PDF Report Generation
 
 Status: review

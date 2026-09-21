@@ -1,3 +1,5 @@
+> Monetary mapping update: [Authoritative Cost Contract V1](authoritative-cost-contract.md) supersedes the historical P50/P80-as-total mappings below.
+
 # Pipeline Output Mapping Plan (Dev 2 → Dev 4)
 
 Objective: Align the Deep Agent Pipeline outputs with the integration contract in `memory-bank/dev2-integration-spec.md` so Dev 4 (PDF + Monte Carlo) can consume `/estimates/{estimateId}` directly.

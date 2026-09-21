@@ -10,6 +10,8 @@ Architecture:
 - Wraps services.price_comparison_service.get_material_prices
 """
 
+from config.safe_logging import safe_error_text
+
 from typing import List, Optional, Dict
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
@@ -99,7 +101,7 @@ def get_material_prices_tool(
         logger.warning(
             "get_material_prices_tool_failed",
             project_id=project_id,
-            error=str(e),
+            error=safe_error_text(e),
         )
         return {
             "project_id": project_id,
@@ -109,7 +111,7 @@ def get_material_prices_tool(
             "prices": {},
             "prices_found": 0,
             "products_requested": len(product_names or []),
-            "error": str(e),
+            "error": safe_error_text(e),
         }
 
 

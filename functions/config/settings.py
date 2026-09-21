@@ -8,6 +8,7 @@ import os
 from typing import Optional
 from dataclasses import dataclass, field
 from dotenv import load_dotenv
+from config.production import validate_production
 
 # Load .env file for non-secret configuration (emulator hosts, feature flags, etc.)
 # Secrets should come from Firebase Secrets Manager or environment variables
@@ -18,7 +19,7 @@ def _get_default_a2a_url() -> str:
     """Get default A2A URL based on environment mode."""
     if (os.getenv("USE_FIREBASE_EMULATORS", "false").lower() == "true" or
         os.getenv("FUNCTIONS_EMULATOR", "false").lower() == "true"):
-        return "http://127.0.0.1:5001/collabcanvas-dev/us-central1"
+        return "http://127.0.0.1:5003/collabcanvas-dev/us-central1"
     return "http://localhost:5001"
 
 
@@ -32,6 +33,7 @@ class Settings:
     """
 
     # LLM Configuration (non-secrets)
+    llm_provider: str = field(default_factory=lambda: os.getenv("LLM_PROVIDER", "openai"))
     llm_model: str = field(default_factory=lambda: os.getenv("LLM_MODEL", "gpt-4o"))
     llm_temperature: float = field(default_factory=lambda: float(os.getenv("LLM_TEMPERATURE", "0.1")))
 
@@ -48,6 +50,10 @@ class Settings:
     pipeline_max_retries: int = field(default_factory=lambda: int(os.getenv("PIPELINE_MAX_RETRIES", "2")))
     pipeline_passing_score: int = field(default_factory=lambda: int(os.getenv("PIPELINE_PASSING_SCORE", "60")))
 
+    # Leave room inside the unchanged A2A timeout for storage and LLM cleanup.
+    cost_execution_budget_seconds: float = field(default_factory=lambda: float(os.getenv("COST_EXECUTION_BUDGET_SECONDS", "240")))
+    price_enrichment_budget_seconds: float = field(default_factory=lambda: float(os.getenv("PRICE_ENRICHMENT_BUDGET_SECONDS", "20")))
+
     # Monte Carlo Configuration
     monte_carlo_iterations: int = field(default_factory=lambda: int(os.getenv("MONTE_CARLO_ITERATIONS", "10000")))
 
@@ -56,6 +62,34 @@ class Settings:
 
     # Internal: cached secret value (use openai_api_key property instead)
     _openai_api_key: Optional[str] = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        validate_production(self)
+        if self.llm_provider not in ("openai", "gemini"):
+            raise ValueError("LLM_PROVIDER must be 'openai' or 'gemini'")
+        if not 0 < self.cost_execution_budget_seconds <= self.a2a_timeout_seconds - 30:
+            raise ValueError("COST_EXECUTION_BUDGET_SECONDS must leave at least 30 seconds before A2A timeout")
+        if not 0 < self.price_enrichment_budget_seconds < self.cost_execution_budget_seconds:
+            raise ValueError("PRICE_ENRICHMENT_BUDGET_SECONDS must be below the Cost budget")
+
+    @property
+    def llm_key_env(self) -> str:
+        return "GEMINI_API_KEY" if self.llm_provider == "gemini" else "OPENAI_API_KEY"
+
+    @property
+    def llm_api_key(self) -> Optional[str]:
+        if self.llm_provider == "gemini":
+            return os.getenv("GEMINI_API_KEY")
+        return self.openai_api_key
+
+    @property
+    def llm_client_options(self) -> dict:
+        if self.llm_provider == "gemini":
+            return {
+                "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+                "use_responses_api": False,
+            }
+        return {}
 
     @property
     def openai_api_key(self) -> Optional[str]:
@@ -75,8 +109,8 @@ class Settings:
         Raises:
             ValueError: If required settings are missing.
         """
-        if not self.openai_api_key and not self.use_firebase_emulators:
-            raise ValueError("OPENAI_API_KEY is required in production")
+        if not self.llm_api_key and not self.use_firebase_emulators:
+            raise ValueError(f"{self.llm_key_env} is required in production")
 
     @property
     def is_emulator_mode(self) -> bool:

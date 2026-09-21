@@ -1,9 +1,11 @@
+import {safeLog, safeErrorMessage} from './safeDiagnostics';
 /**
  * Clarification Agent Cloud Function
  * Handles the clarification chat for scope understanding
  */
 
-import { onCall, HttpsError } from 'firebase-functions/v2/https';
+import { HttpsError } from 'firebase-functions/v2/https';
+import { onCall, allowedOrigins } from './functionSecurity';
 import { OpenAI } from 'openai';
 
 // Lazy initialization to avoid timeout during module load
@@ -13,7 +15,7 @@ function getOpenAI(): OpenAI {
   if (!_openai) {
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
-      console.error('[CLARIFICATION_AGENT] OPENAI_API_KEY not configured');
+      safeLog('clarificationAgent.error', '[CLARIFICATION_AGENT] OPENAI_API_KEY not configured');
       throw new Error('OPENAI_API_KEY not configured');
     }
     _openai = new OpenAI({ apiKey });
@@ -170,7 +172,7 @@ interface ClarificationResponse {
 }
 
 export const clarificationAgent = onCall({
-  cors: true,
+  cors: allowedOrigins(),
   // Secrets for production; emulator uses .env.local
   secrets: ['OPENAI_API_KEY'],
   timeoutSeconds: 60,
@@ -268,7 +270,7 @@ export const clarificationAgent = onCall({
       ...response,
     };
   } catch (error) {
-    console.error('Clarification Agent Error:', error);
+    safeLog('clarificationAgent.error', 'Clarification Agent Error:', error);
 
     if (error instanceof HttpsError) {
       throw error;
@@ -281,7 +283,7 @@ export const clarificationAgent = onCall({
       extractedData: {},
       clarificationComplete: false,
       completionReason: null,
-      error: error instanceof Error ? error.message : String(error),
+      error: safeErrorMessage(error instanceof Error ? error.message : String(error)),
     };
   }
 });

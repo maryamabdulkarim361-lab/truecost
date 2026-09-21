@@ -3,6 +3,8 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+pytestmark = pytest.mark.usefixtures("block_network")
+
 
 class TestLLMService:
     """Tests for LLMService."""
@@ -104,11 +106,13 @@ class TestLLMService:
                 user_message="Give me JSON."
             )
         
-        assert exc_info.value.code == "LLM_ERROR"
+        assert exc_info.value.code == "LLM_INVALID_RESPONSE"
     
     def test_create_chat_model(self, mock_llm_service):
         """Test creating a new chat model."""
-        with patch('services.llm_service.ChatOpenAI') as mock_chat:
+        with patch('services.llm_service.ChatOpenAI') as mock_chat, patch(
+            'services.llm_service.DefaultAsyncHttpxClient'
+        ) as mock_http:
             mock_chat.return_value = MagicMock()
             
             model = mock_llm_service.create_chat_model(
@@ -116,11 +120,14 @@ class TestLLMService:
                 temperature=0.5
             )
             
-            mock_chat.assert_called_once_with(
-                model="gpt-4-turbo",
-                temperature=0.5,
-                api_key=mock_llm_service.api_key
-            )
+            mock_chat.assert_called_once()
+            options = mock_chat.call_args.kwargs
+            assert options['model'] == 'gpt-4-turbo'
+            assert options['temperature'] == 0.5
+            assert options['api_key'] == mock_llm_service.api_key
+            assert options['async_client'] is not None
+            assert options['root_async_client'] is not None
+            mock_http.assert_not_called()
     
     def test_token_tracking(self, mock_llm_service):
         """Test token usage tracking."""

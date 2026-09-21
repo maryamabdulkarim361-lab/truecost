@@ -16,6 +16,8 @@ References:
 - docs/architecture.md (ADR-006: WeasyPrint + Jinja2)
 """
 
+from config.safe_logging import safe_error_text
+
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
 from datetime import datetime
@@ -25,6 +27,7 @@ import time
 import io
 import os
 import base64
+import math
 
 import structlog
 from jinja2 import Environment, FileSystemLoader, select_autoescape
@@ -176,6 +179,8 @@ def _get_jinja_env() -> Environment:
         loader=FileSystemLoader(str(TEMPLATE_DIR)),
         autoescape=select_autoescape(["html", "xml"]),
     )
+    env.filters["money"] = _money
+    env.filters["number"] = _number
     return env
 
 
@@ -220,7 +225,7 @@ async def _load_estimate_data(estimate_id: str) -> Dict[str, Any]:
         logger.error(
             "estimate_load_failed",
             estimate_id=estimate_id,
-            error=str(e),
+            error=safe_error_text(e),
         )
         return {}
 
@@ -272,7 +277,7 @@ async def _load_related_data(estimate_id: str) -> Dict[str, Any]:
         logger.error(
             "related_data_load_failed",
             estimate_id=estimate_id,
-            error=str(e),
+            error=safe_error_text(e),
         )
 
     return related
@@ -281,6 +286,54 @@ async def _load_related_data(estimate_id: str) -> Dict[str, Any]:
 # =============================================================================
 # PDF Generation
 # =============================================================================
+
+
+def _number(value):
+    """Accept finite numeric compatibility values, never invent a zero."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        result = float(value)
+        return result if math.isfinite(result) else None
+    except (ValueError, OverflowError):
+        return None
+
+
+def _money(value):
+    value = _number(value)
+    return f"${value:,.2f}" if value is not None else "N/A"
+
+
+def _report_money(data):
+    """Explicit Final fields precede root aliases; missing values stay missing."""
+    final = data.get("finalOutput") or {}
+    summary = final.get("executiveSummary") or {}
+    breakdown = final.get("costBreakdown") or {}
+
+    def first(*values):
+        return next((_number(v) for v in values if v is not None), None)
+
+    base = first(final.get("baseEstimate"), breakdown.get("totalBeforeContingency"),
+                 summary.get("baseCost"), data.get("baseEstimate"))
+    contingency = first(final.get("contingency"), breakdown.get("contingency"),
+                        summary.get("contingency"), data.get("contingency"))
+    total = first(final.get("finalEstimate"), data.get("finalEstimate"),
+                  breakdown.get("totalWithContingency"), summary.get("totalCost"),
+                  final.get("totalCost"), data.get("totalCost"))
+    confidence = summary.get("confidenceRange") or {}
+    result = {"base_estimate": base, "contingency": contingency, "total_cost": total,
+              "contingency_pct": contingency / base * 100
+              if base is not None and base > 0 and contingency is not None else None}
+    result.update({k: first(confidence.get(k), data.get(k)) for k in ("p50", "p80", "p90")})
+    result["has_percentiles"] = all(result[k] is not None for k in ("p50", "p80", "p90"))
+    fields = [("Materials", "materials"), ("Labor", "labor"), ("Equipment", "equipment"),
+              ("Location Adjustment", "locationAdjustment"), ("Overhead", "overhead"),
+              ("Profit", "profit"), ("Permits", "permits"), ("Taxes", "taxes")]
+    components = [(label, _number(breakdown.get(key))) for label, key in fields]
+    result["base_components"] = components if (base is not None
+        and all(value is not None for _, value in components)
+        and round(sum(value for _, value in components), 2) == round(base, 2)) else []
+    return result
 
 
 def _render_html(
@@ -326,11 +379,7 @@ def _render_html(
         },
         # Estimate summary
         "estimate": {
-            "total_cost": estimate_data.get("totalCost", 0),
-            "p50": estimate_data.get("p50", estimate_data.get("totalCost", 0)),
-            "p80": estimate_data.get("p80", estimate_data.get("totalCost", 0) * 1.1),
-            "p90": estimate_data.get("p90", estimate_data.get("totalCost", 0) * 1.15),
-            "contingency_pct": estimate_data.get("contingencyPct", 10),
+            **_report_money(estimate_data),
             "timeline_weeks": estimate_data.get("timelineWeeks", 6),
             "monte_carlo_iterations": estimate_data.get("monteCarloIterations", 1000),
             "cost_drivers": estimate_data.get("costDrivers", []),
@@ -443,7 +492,7 @@ async def _upload_to_storage(
         logger.error(
             "storage_upload_failed",
             path=storage_path,
-            error=str(e),
+            error=safe_error_text(e),
         )
         raise
 
@@ -558,7 +607,7 @@ async def generate_pdf(
         logger.error(
             "pdf_generation_error",
             estimate_id=estimate_id,
-            error=str(e),
+            error=safe_error_text(e),
             error_type=type(e).__name__,
             duration_ms=round(duration_ms, 2),
         )
@@ -671,7 +720,7 @@ def generate_pdf_local(
         logger.error(
             "pdf_generation_error_local",
             output_path=output_path,
-            error=str(e),
+            error=safe_error_text(e),
             error_type=type(e).__name__,
             duration_ms=round(duration_ms, 2),
         )

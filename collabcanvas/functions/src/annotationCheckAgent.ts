@@ -1,10 +1,12 @@
+import {safeLog, safeErrorMessage} from './safeDiagnostics';
 /**
  * Annotation Check Agent Cloud Function
  * Validates if user has annotated all required fields based on the project scope
  * This is the clarification agent for the annotation workflow
  */
 
-import { onCall, HttpsError } from 'firebase-functions/v2/https';
+import { HttpsError } from 'firebase-functions/v2/https';
+import { onCall, allowedOrigins } from './functionSecurity';
 import { OpenAI } from 'openai';
 
 // Lazy initialization to avoid timeout during module load
@@ -14,7 +16,7 @@ function getOpenAI(): OpenAI {
   if (!_openai) {
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
-      console.error('[ANNOTATION_CHECK] OPENAI_API_KEY not configured');
+      safeLog('annotationCheckAgent.error', '[ANNOTATION_CHECK] OPENAI_API_KEY not configured');
       throw new Error('OPENAI_API_KEY not configured');
     }
     _openai = new OpenAI({ apiKey });
@@ -502,7 +504,7 @@ function formatLayerDetails(layers: LayerAnalysis[], scale: ScaleInfo | undefine
 // ===================
 
 export const annotationCheckAgent = onCall({
-  cors: true,
+  cors: allowedOrigins(),
   secrets: ['OPENAI_API_KEY'],
   timeoutSeconds: 60,
 }, async (request) => {
@@ -630,7 +632,7 @@ export const annotationCheckAgent = onCall({
 
     return response;
   } catch (error) {
-    console.error('Annotation Check Agent Error:', error);
+    safeLog('annotationCheckAgent.error', 'Annotation Check Agent Error:', error);
 
     if (error instanceof HttpsError) {
       throw error;
@@ -651,7 +653,7 @@ export const annotationCheckAgent = onCall({
         totalWallLength: 0,
         totalFloorArea: 0,
       },
-      error: error instanceof Error ? error.message : String(error),
+      error: safeErrorMessage(error instanceof Error ? error.message : String(error)),
     };
   }
 });

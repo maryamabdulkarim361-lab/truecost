@@ -1,0 +1,17 @@
+{# Base includes all deterministic costs. The allowance is added exactly once. #}
+{% if not client_ready and estimate.base_components %}
+<h3>Base Estimate Components</h3>
+<table class="base-components">
+{% for label, amount in estimate.base_components %}
+<tr><td>{{ label }}</td><td class="currency">{{ amount | money }}</td></tr>
+{% endfor %}
+</table>
+{% endif %}
+<table class="monetary-summary">
+<tbody>
+<tr><td>Base Estimate (before contingency)</td><td class="currency">{{ estimate.base_estimate | money }}</td></tr>
+<tr><td>Selected Contingency</td><td class="currency">{{ estimate.contingency | money }}</td></tr>
+</tbody>
+<tfoot><tr><td><strong>Total Project Cost</strong></td><td class="currency"><strong>{{ estimate.total_cost | money }}</strong></td></tr></tfoot>
+</table>
+<p>Contingency is included once in Total Project Cost. Unavailable components are shown as N/A.</p>

@@ -1,12 +1,14 @@
 "use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.extractProductId = exports.incrementMatchCount = exports.saveToGlobalMaterials = exports.validateGlobalMatch = exports.selectBestGlobalMatch = exports.findInGlobalMaterials = exports.generateMaterialId = exports.normalizeProductName = exports.GLOBAL_MATCH_CONFIDENCE_THRESHOLD = exports.DEFAULT_ZIPCODE = void 0;
+const safeDiagnostics_1 = require("./safeDiagnostics");
 /**
  * Global Materials Database Operations
  * FR7-FR36: CRUD, search, LLM validation, and auto-population
  */
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.extractProductId = exports.incrementMatchCount = exports.saveToGlobalMaterials = exports.validateGlobalMatch = exports.selectBestGlobalMatch = exports.findInGlobalMaterials = exports.generateMaterialId = exports.normalizeProductName = exports.GLOBAL_MATCH_CONFIDENCE_THRESHOLD = exports.DEFAULT_ZIPCODE = void 0;
 const firestore_1 = require("firebase-admin/firestore");
 const openai_1 = require("openai");
+const openaiAvailability_1 = require("./openaiAvailability");
 const globalMaterials_1 = require("./types/globalMaterials");
 Object.defineProperty(exports, "DEFAULT_ZIPCODE", { enumerable: true, get: function () { return globalMaterials_1.DEFAULT_ZIPCODE; } });
 Object.defineProperty(exports, "GLOBAL_MATCH_CONFIDENCE_THRESHOLD", { enumerable: true, get: function () { return globalMaterials_1.GLOBAL_MATCH_CONFIDENCE_THRESHOLD; } });
@@ -43,10 +45,10 @@ async function findInGlobalMaterials(db, searchQuery, zipCode) {
     const effectiveZipCode = zipCode || globalMaterials_1.DEFAULT_ZIPCODE;
     const normalizedQuery = searchQuery.toLowerCase().trim();
     const queryWords = normalizedQuery.split(/\s+/).filter(w => w.length > 1);
-    console.log(`[GLOBAL_MATERIALS] ========== SEARCH START ==========`);
-    console.log(`[GLOBAL_MATERIALS] Search query: "${searchQuery}"`);
-    console.log(`[GLOBAL_MATERIALS] Query words: ${JSON.stringify(queryWords)}`);
-    console.log(`[GLOBAL_MATERIALS] ZipCode: ${effectiveZipCode}`);
+    (0, safeDiagnostics_1.safeLog)('globalMaterials.log', `[GLOBAL_MATERIALS] ========== SEARCH START ==========`);
+    (0, safeDiagnostics_1.safeLog)('globalMaterials.log', `[GLOBAL_MATERIALS] Search query: "${searchQuery}"`);
+    (0, safeDiagnostics_1.safeLog)('globalMaterials.log', `[GLOBAL_MATERIALS] Query words: ${JSON.stringify(queryWords)}`);
+    (0, safeDiagnostics_1.safeLog)('globalMaterials.log', `[GLOBAL_MATERIALS] ZipCode: ${effectiveZipCode}`);
     try {
         // Step 1: Try exact alias match first (fast path)
         const exactSnapshot = await db.collection('globalMaterials')
@@ -56,10 +58,10 @@ async function findInGlobalMaterials(db, searchQuery, zipCode) {
             .get();
         if (!exactSnapshot.empty) {
             const candidates = exactSnapshot.docs.map(doc => doc.data());
-            console.log(`[GLOBAL_MATERIALS] EXACT MATCH found: ${candidates.length} candidate(s)`);
+            (0, safeDiagnostics_1.safeLog)('globalMaterials.log', `[GLOBAL_MATERIALS] EXACT MATCH found: ${candidates.length} candidate(s)`);
             return candidates;
         }
-        console.log(`[GLOBAL_MATERIALS] No exact alias match, trying fuzzy search...`);
+        (0, safeDiagnostics_1.safeLog)('globalMaterials.log', `[GLOBAL_MATERIALS] No exact alias match, trying fuzzy search...`);
         // Step 2: Fuzzy search - check if any query word matches an alias
         // Try each significant word from the query
         for (const word of queryWords) {
@@ -72,28 +74,28 @@ async function findInGlobalMaterials(db, searchQuery, zipCode) {
                 .get();
             if (!wordSnapshot.empty) {
                 const candidates = wordSnapshot.docs.map(doc => doc.data());
-                console.log(`[GLOBAL_MATERIALS] FUZZY MATCH on word "${word}": ${candidates.length} candidate(s)`);
+                (0, safeDiagnostics_1.safeLog)('globalMaterials.log', `[GLOBAL_MATERIALS] FUZZY MATCH on word "${word}": ${candidates.length} candidate(s)`);
                 // Return candidates that have the most word overlap
                 return candidates;
             }
         }
         // Step 3: If still no match, get all materials for zipCode and let LLM pick
-        console.log(`[GLOBAL_MATERIALS] No word match, fetching all for zipCode...`);
+        (0, safeDiagnostics_1.safeLog)('globalMaterials.log', `[GLOBAL_MATERIALS] No word match, fetching all for zipCode...`);
         const allSnapshot = await db.collection('globalMaterials')
             .where('zipCode', '==', effectiveZipCode)
             .limit(50)
             .get();
         if (!allSnapshot.empty) {
             const allMaterials = allSnapshot.docs.map(doc => doc.data());
-            console.log(`[GLOBAL_MATERIALS] Returning ${allMaterials.length} materials for LLM selection`);
+            (0, safeDiagnostics_1.safeLog)('globalMaterials.log', `[GLOBAL_MATERIALS] Returning ${allMaterials.length} materials for LLM selection`);
             return allMaterials;
         }
-        console.log(`[GLOBAL_MATERIALS] NO MATERIALS found for zipCode ${effectiveZipCode}`);
-        console.log(`[GLOBAL_MATERIALS] ========== SEARCH END ==========`);
+        (0, safeDiagnostics_1.safeLog)('globalMaterials.log', `[GLOBAL_MATERIALS] NO MATERIALS found for zipCode ${effectiveZipCode}`);
+        (0, safeDiagnostics_1.safeLog)('globalMaterials.log', `[GLOBAL_MATERIALS] ========== SEARCH END ==========`);
         return [];
     }
     catch (error) {
-        console.error(`[GLOBAL_MATERIALS] Search error:`, error);
+        (0, safeDiagnostics_1.safeLog)('globalMaterials.error', `[GLOBAL_MATERIALS] Search error:`, error);
         return [];
     }
 }
@@ -112,15 +114,14 @@ async function selectBestGlobalMatch(searchQuery, candidates) {
         const validation = await validateGlobalMatch(searchQuery, candidates[0]);
         return { candidate: candidates[0], confidence: validation.confidence, reasoning: validation.reasoning };
     }
-    const apiKey = process.env.OPENAI_API_KEY;
-    if (!apiKey) {
-        console.warn('[GLOBAL_MATERIALS] OPENAI_API_KEY not configured - returning first candidate');
+    if (!(0, openaiAvailability_1.isOpenAIEnabled)()) {
+        (0, safeDiagnostics_1.safeLog)('globalMaterials.warn', '[GLOBAL_MATERIALS] OpenAI unavailable - returning first candidate');
         return { candidate: candidates[0], confidence: 0.5, reasoning: 'OpenAI not configured' };
     }
-    const openai = new openai_1.default({ apiKey });
+    const openai = new openai_1.default({ apiKey: process.env.OPENAI_API_KEY });
     // Create a summary of candidates for LLM
     const candidateSummary = candidates.slice(0, 20).map((c, i) => `${i}: "${c.name}" (aliases: ${c.aliases.slice(0, 3).join(', ')})`).join('\n');
-    console.log(`[GLOBAL_MATERIALS] LLM selecting from ${candidates.length} candidates for "${searchQuery}"`);
+    (0, safeDiagnostics_1.safeLog)('globalMaterials.log', `[GLOBAL_MATERIALS] LLM selecting from ${candidates.length} candidates for "${searchQuery}"`);
     try {
         const response = await openai.chat.completions.create({
             model: 'gpt-4o-mini',
@@ -142,20 +143,20 @@ If NO good match, return: { "index": -1, "confidence": 0, "reasoning": "no match
             temperature: 0.1,
         });
         const content = ((_b = (_a = response.choices[0]) === null || _a === void 0 ? void 0 : _a.message) === null || _b === void 0 ? void 0 : _b.content) || '{}';
-        console.log(`[GLOBAL_MATERIALS] LLM selection response: ${content.substring(0, 200)}`);
+        (0, safeDiagnostics_1.safeLog)('globalMaterials.log', `[GLOBAL_MATERIALS] LLM selection response: ${content.substring(0, 200)}`);
         const cleaned = content.replace(/```json\n?/gi, '').replace(/```\n?/g, '').trim();
         const parsed = JSON.parse(cleaned);
         const index = typeof parsed.index === 'number' ? parsed.index : -1;
         const confidence = typeof parsed.confidence === 'number' ? parsed.confidence : 0;
         const reasoning = parsed.reasoning || 'No reasoning';
         if (index >= 0 && index < candidates.length) {
-            console.log(`[GLOBAL_MATERIALS] Selected candidate ${index}: "${candidates[index].name}" (confidence: ${confidence})`);
+            (0, safeDiagnostics_1.safeLog)('globalMaterials.log', `[GLOBAL_MATERIALS] Selected candidate ${index}: "${candidates[index].name}" (confidence: ${confidence})`);
             return { candidate: candidates[index], confidence, reasoning };
         }
         return { candidate: null, confidence: 0, reasoning };
     }
     catch (err) {
-        console.error('[GLOBAL_MATERIALS] LLM selection error:', err);
+        (0, safeDiagnostics_1.safeLog)('globalMaterials.error', '[GLOBAL_MATERIALS] LLM selection error:', err);
         // Fallback: use word overlap to pick best candidate
         let bestCandidate = candidates[0];
         let bestOverlap = 0;
@@ -167,7 +168,7 @@ If NO good match, return: { "index": -1, "confidence": 0, "reasoning": "no match
             }
         }
         const confidence = Math.min(bestOverlap + 0.3, 0.95);
-        console.log(`[GLOBAL_MATERIALS] LLM failed - word overlap selected "${bestCandidate.name}" (${bestOverlap.toFixed(2)} -> ${confidence.toFixed(2)})`);
+        (0, safeDiagnostics_1.safeLog)('globalMaterials.log', `[GLOBAL_MATERIALS] LLM failed - word overlap selected "${bestCandidate.name}" (${bestOverlap.toFixed(2)} -> ${confidence.toFixed(2)})`);
         return { candidate: bestCandidate, confidence, reasoning: `Word overlap fallback (${(bestOverlap * 100).toFixed(0)}% match)` };
     }
 }
@@ -194,15 +195,14 @@ function calculateWordOverlap(query, candidate) {
 }
 async function validateGlobalMatch(searchQuery, candidate) {
     var _a, _b;
-    const apiKey = process.env.OPENAI_API_KEY;
-    if (!apiKey) {
+    if (!(0, openaiAvailability_1.isOpenAIEnabled)()) {
         // Fallback: use word overlap scoring
         const overlap = calculateWordOverlap(searchQuery, candidate);
         const confidence = Math.min(overlap + 0.3, 0.95); // Boost overlap score
-        console.log(`[GLOBAL_MATERIALS] No API key - word overlap: ${overlap.toFixed(2)} -> confidence: ${confidence.toFixed(2)}`);
+        (0, safeDiagnostics_1.safeLog)('globalMaterials.log', `[GLOBAL_MATERIALS] Word overlap fallback: ${overlap.toFixed(2)} -> confidence: ${confidence.toFixed(2)}`);
         return { confidence, reasoning: `Word overlap fallback (${(overlap * 100).toFixed(0)}% match)` };
     }
-    const openai = new openai_1.default({ apiKey });
+    const openai = new openai_1.default({ apiKey: process.env.OPENAI_API_KEY });
     try {
         const response = await openai.chat.completions.create({
             model: 'gpt-4o-mini',
@@ -227,7 +227,7 @@ Return ONLY JSON: { "confidence": number (0-1), "reasoning": "brief explanation"
             temperature: 0.1,
         });
         const content = ((_b = (_a = response.choices[0]) === null || _a === void 0 ? void 0 : _a.message) === null || _b === void 0 ? void 0 : _b.content) || '{}';
-        console.log(`[GLOBAL_MATERIALS] LLM validation response: ${content.substring(0, 150)}...`);
+        (0, safeDiagnostics_1.safeLog)('globalMaterials.log', `[GLOBAL_MATERIALS] LLM validation response: ${content.substring(0, 150)}...`);
         // Parse response
         const cleaned = content
             .replace(/```json\n?/gi, '')
@@ -241,16 +241,16 @@ Return ONLY JSON: { "confidence": number (0-1), "reasoning": "brief explanation"
             };
         }
         catch (_c) {
-            console.warn('[GLOBAL_MATERIALS] JSON parse failed for LLM response');
+            (0, safeDiagnostics_1.safeLog)('globalMaterials.warn', '[GLOBAL_MATERIALS] JSON parse failed for LLM response');
             return { confidence: 0.5, reasoning: 'JSON parse failed - using moderate confidence' };
         }
     }
     catch (err) {
-        console.error('[GLOBAL_MATERIALS] OpenAI error:', err);
+        (0, safeDiagnostics_1.safeLog)('globalMaterials.error', '[GLOBAL_MATERIALS] OpenAI error:', err);
         // Fallback to word overlap when OpenAI fails
         const overlap = calculateWordOverlap(searchQuery, candidate);
         const confidence = Math.min(overlap + 0.3, 0.95);
-        console.log(`[GLOBAL_MATERIALS] OpenAI failed - using word overlap: ${overlap.toFixed(2)} -> confidence: ${confidence.toFixed(2)}`);
+        (0, safeDiagnostics_1.safeLog)('globalMaterials.log', `[GLOBAL_MATERIALS] OpenAI failed - using word overlap: ${overlap.toFixed(2)} -> confidence: ${confidence.toFixed(2)}`);
         return { confidence, reasoning: `Word overlap fallback (${(overlap * 100).toFixed(0)}% match)` };
     }
 }
@@ -264,7 +264,7 @@ async function saveToGlobalMaterials(db, material, searchQuery) {
     var _a, _b, _c, _d, _e, _f;
     const id = generateMaterialId(material.name, material.zipCode);
     const docRef = db.collection('globalMaterials').doc(id);
-    console.log(`[GLOBAL_MATERIALS] Saving material: ${id}`);
+    (0, safeDiagnostics_1.safeLog)('globalMaterials.log', `[GLOBAL_MATERIALS] Saving material: ${id}`);
     try {
         const existingDoc = await docRef.get();
         const now = Date.now();
@@ -297,7 +297,7 @@ async function saveToGlobalMaterials(db, material, searchQuery) {
                 updatedAt: now,
                 matchCount: (existing.matchCount || 0) + 1,
             });
-            console.log(`[GLOBAL_MATERIALS] Updated existing material: ${id} (matchCount: ${(existing.matchCount || 0) + 1})`);
+            (0, safeDiagnostics_1.safeLog)('globalMaterials.log', `[GLOBAL_MATERIALS] Updated existing material: ${id} (matchCount: ${(existing.matchCount || 0) + 1})`);
         }
         else {
             // Create new document - filter out undefined retailer values
@@ -322,11 +322,11 @@ async function saveToGlobalMaterials(db, material, searchQuery) {
                 source: material.source,
             };
             await docRef.set(newMaterial);
-            console.log(`[GLOBAL_MATERIALS] Created new material: ${id}`);
+            (0, safeDiagnostics_1.safeLog)('globalMaterials.log', `[GLOBAL_MATERIALS] Created new material: ${id}`);
         }
     }
     catch (err) {
-        console.error(`[GLOBAL_MATERIALS] Save error for ${id}:`, err);
+        (0, safeDiagnostics_1.safeLog)('globalMaterials.error', `[GLOBAL_MATERIALS] Save error for ${id}:`, err);
         // Don't throw - cache failures shouldn't break the comparison
     }
 }
@@ -340,7 +340,7 @@ function incrementMatchCount(db, materialId) {
         matchCount: firestore_1.FieldValue.increment(1),
         updatedAt: Date.now(),
     }).catch((err) => {
-        console.warn(`[GLOBAL_MATERIALS] Failed to increment matchCount for ${materialId}:`, err);
+        (0, safeDiagnostics_1.safeLog)('globalMaterials.warn', `[GLOBAL_MATERIALS] Failed to increment matchCount for ${materialId}:`, err);
     });
 }
 exports.incrementMatchCount = incrementMatchCount;

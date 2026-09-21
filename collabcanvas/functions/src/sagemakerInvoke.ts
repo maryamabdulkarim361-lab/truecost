@@ -1,9 +1,11 @@
+import {safeLog, safeErrorMessage} from './safeDiagnostics';
 /**
  * SageMaker Endpoint Invocation Cloud Function
  * Handles server-side SageMaker endpoint invocation with AWS credentials
  */
 
-import { onCall, HttpsError } from 'firebase-functions/v2/https';
+import { HttpsError } from 'firebase-functions/v2/https';
+import { onCall, allowedOrigins } from './functionSecurity';
 import { defineSecret } from 'firebase-functions/params';
 import * as admin from 'firebase-admin';
 
@@ -101,8 +103,8 @@ async function invokeSageMakerEndpoint(
   };
 
   try {
-    console.log(`[SAGEMAKER] Invoking endpoint: ${endpointName} (attempt ${attempt}/${maxAttempts})`);
-    console.log(`[SAGEMAKER] Region: ${awsRegion}, Image data length: ${imageData.length} chars`);
+    safeLog('sagemakerInvoke.log', `[SAGEMAKER] Invoking endpoint: ${endpointName} (attempt ${attempt}/${maxAttempts})`);
+    safeLog('sagemakerInvoke.log', `[SAGEMAKER] Region: ${awsRegion}, Image data length: ${imageData.length} chars`);
 
     const response = await sagemakerRuntime.invokeEndpoint({
       EndpointName: endpointName,
@@ -126,11 +128,11 @@ async function invokeSageMakerEndpoint(
     }
 
     if (!result.detections) {
-      console.warn('[SAGEMAKER] Response missing detections key');
+      safeLog('sagemakerInvoke.warn', '[SAGEMAKER] Response missing detections key');
       return [];
     }
 
-    console.log(`[SAGEMAKER] Successfully received ${result.detections.length} detections`);
+    safeLog('sagemakerInvoke.log', `[SAGEMAKER] Successfully received ${result.detections.length} detections`);
     return result.detections;
   } catch (error: unknown) {
     const errorMessage = error instanceof Error ? error.message : String(error);
@@ -144,7 +146,7 @@ async function invokeSageMakerEndpoint(
     if (errorStr.includes('timeout') || errorStr.includes('timed out')) {
       if (attempt < maxAttempts) {
         const delay = Math.pow(2, attempt - 1) * 1000; // Exponential backoff: 1s, 2s, 4s
-        console.log(`[SAGEMAKER] Timeout error, retrying after ${delay}ms...`);
+        safeLog('sagemakerInvoke.log', `[SAGEMAKER] Timeout error, retrying after ${delay}ms...`);
         await sleep(delay);
         return invokeSageMakerEndpoint(imageData, credentials, attempt + 1, maxAttempts);
       }
@@ -158,7 +160,7 @@ async function invokeSageMakerEndpoint(
     // Retry on transient errors
     if ((errorStr.includes('throttling') || errorStr.includes('service unavailable')) && attempt < maxAttempts) {
       const delay = Math.pow(2, attempt - 1) * 1000;
-      console.log(`[SAGEMAKER] Transient error, retrying after ${delay}ms...`);
+      safeLog('sagemakerInvoke.log', `[SAGEMAKER] Transient error, retrying after ${delay}ms...`);
       await sleep(delay);
       return invokeSageMakerEndpoint(imageData, credentials, attempt + 1, maxAttempts);
     }
@@ -172,7 +174,7 @@ async function invokeSageMakerEndpoint(
  */
 export const sagemakerInvoke = onCall<InvokeAnnotationEndpointRequest>(
   {
-    cors: true, // CORS is handled automatically by Firebase Functions v2
+    cors: allowedOrigins(), // CORS is handled automatically by Firebase Functions v2
     timeoutSeconds: 90, // Allow up to 90 seconds for endpoint invocation
     memory: '512MiB',
     maxInstances: 10,
@@ -198,9 +200,9 @@ export const sagemakerInvoke = onCall<InvokeAnnotationEndpointRequest>(
         region: awsRegionSecret.value() || DEFAULT_AWS_REGION,
       };
 
-      console.log(`[SAGEMAKER] Processing annotation request for project: ${projectId}`);
-      console.log(`[SAGEMAKER] Using endpoint: ${credentials.endpointName} in region: ${credentials.region}`);
-      console.log(`[SAGEMAKER] Image data length: ${imageData.length} characters`);
+      safeLog('sagemakerInvoke.log', `[SAGEMAKER] Processing annotation request for project: ${projectId}`);
+      safeLog('sagemakerInvoke.log', `[SAGEMAKER] Using endpoint: ${credentials.endpointName} in region: ${credentials.region}`);
+      safeLog('sagemakerInvoke.log', `[SAGEMAKER] Image data length: ${imageData.length} characters`);
 
       // Validate base64 image data
       try {
@@ -211,7 +213,7 @@ export const sagemakerInvoke = onCall<InvokeAnnotationEndpointRequest>(
       } catch (validationError) {
         throw new HttpsError(
           'invalid-argument',
-          `Invalid image format: ${validationError instanceof Error ? validationError.message : String(validationError)}`
+          'Operation failed'
         );
       }
 
@@ -226,7 +228,7 @@ export const sagemakerInvoke = onCall<InvokeAnnotationEndpointRequest>(
           : 'No items detected in the image',
       } as InvokeAnnotationEndpointResponse;
     } catch (error) {
-      console.error('[SAGEMAKER] Error:', error);
+      safeLog('sagemakerInvoke.error', '[SAGEMAKER] Error:', error);
 
       if (error instanceof HttpsError) {
         throw error;
@@ -237,8 +239,8 @@ export const sagemakerInvoke = onCall<InvokeAnnotationEndpointRequest>(
       return {
         success: false,
         detections: [],
-        error: errorMessage,
-        message: `Failed to invoke annotation endpoint: ${errorMessage}`,
+        error: safeErrorMessage(errorMessage),
+        message: safeErrorMessage(`Failed to invoke annotation endpoint: ${errorMessage}`),
       } as InvokeAnnotationEndpointResponse;
     }
   }

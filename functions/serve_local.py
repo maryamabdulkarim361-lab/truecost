@@ -7,7 +7,9 @@ This server mimics the Firebase Functions emulator endpoints.
 Usage:
     cd functions
     source venv/bin/activate
-    export OPENAI_API_KEY='sk-proj-...'  # Required for LLM operations
+    # Configure OPENAI_API_KEY privately for the default OpenAI provider.
+    # Or set LLM_PROVIDER=gemini, LLM_MODEL=gemini-3.6-flash,
+    # and configure GEMINI_API_KEY privately in this shell.
     python serve_local.py
 
 This will start a Flask server on port 5003 that handles:
@@ -20,7 +22,7 @@ The TypeScript orchestrator will call these endpoints when PYTHON_FUNCTIONS_URL 
 
 SECRETS:
     Secrets are NOT stored in .env files. Set them as environment variables:
-        export OPENAI_API_KEY='sk-proj-...'
+        OPENAI_API_KEY for openai, or GEMINI_API_KEY for gemini
         export SERP_API_KEY='...'
         export BLS_API_KEY='...'
 
@@ -30,25 +32,25 @@ SECRETS:
 import os
 import sys
 
+# Never turn a production process into an emulator.
+if os.getenv("APP_ENV") == "production" or os.getenv("K_SERVICE"):
+    raise RuntimeError("serve_local.py is development-only")
+
 # Set environment for local development
 os.environ.setdefault('FUNCTIONS_EMULATOR', 'true')
 os.environ.setdefault('GCLOUD_PROJECT', 'collabcanvas-dev')
 os.environ.setdefault('FIRESTORE_EMULATOR_HOST', '127.0.0.1:8081')
 
-# Check for required secrets and warn if missing
-_missing_secrets = []
-if not os.environ.get('OPENAI_API_KEY'):
-    _missing_secrets.append('OPENAI_API_KEY')
+# Validate only the selected provider's environment credential.
+from config.settings import settings
 
-if _missing_secrets:
-    print("\n" + "=" * 60)
-    print("WARNING: Missing required secrets for local development!")
-    print("=" * 60)
-    for secret in _missing_secrets:
-        print(f"  - {secret}")
-    print("\nSet them before running:")
-    print("  export OPENAI_API_KEY='sk-proj-...'")
-    print("=" * 60 + "\n")
+
+def validate_local_llm_environment():
+    if not os.environ.get(settings.llm_key_env):
+        raise RuntimeError(f"{settings.llm_key_env} is required for the selected LLM provider")
+
+
+validate_local_llm_environment()
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -95,6 +97,10 @@ class MockRequest:
         self._json_data = None
         self.method = flask_request.method
         self.headers = dict(flask_request.headers)
+
+    def __getattr__(self, name):
+        """Forward unsupported request attributes to Flask request."""
+        return getattr(self._request, name)
 
     def get_json(self, force=False):
         if self._json_data is None:
@@ -220,7 +226,9 @@ def handle_a2a_final_critic():
 # Health check
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'ok', 'service': 'truecost-python-functions'})
+    from services.local_provider_budget import control_state
+    return jsonify({'status': 'ok', 'service': 'truecost-python-functions',
+                    'local_provider_budget': control_state()})
 
 
 if __name__ == '__main__':
@@ -244,4 +252,10 @@ if __name__ == '__main__':
 ║                                                                ║
 ╚════════════════════════════════════════════════════════════════╝
 """)
-    app.run(host='127.0.0.1', port=port, debug=True, threaded=True)
+    app.run(
+        host='127.0.0.1',
+        port=port,
+        debug=True,
+        threaded=True,
+        use_reloader=False,
+    )

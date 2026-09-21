@@ -14,8 +14,12 @@ References:
 - Story 4.5: Real Data Integration
 """
 
+from config.safe_logging import safe_error_text
+
 import asyncio
+import os
 import time
+from uuid import uuid4
 from typing import Dict, List, Optional, Any
 import structlog
 
@@ -23,6 +27,7 @@ import httpx
 from firebase_admin import firestore
 
 from config.settings import settings
+from services.cost_execution import bounded_storage_call
 
 logger = structlog.get_logger()
 
@@ -31,16 +36,10 @@ logger = structlog.get_logger()
 # =============================================================================
 
 # Firebase Functions URL configuration
-FUNCTIONS_BASE_URL = (
-    "http://127.0.0.1:5001/collabcanvas-dev/us-central1"
-    if settings.use_firebase_emulators
-    else f"https://us-central1-{settings.firebase_project_id or 'collabcanvas-dev'}.cloudfunctions.net"
-)
-
 COMPARE_PRICES_FUNCTION = "comparePrices"
-FUNCTION_TIMEOUT_SECONDS = 540  # Match TypeScript function timeout
+FUNCTION_TIMEOUT_SECONDS = 20  # Optional enrichment, not the Node deployment limit
 POLL_INTERVAL_SECONDS = 2  # Check Firestore every 2 seconds
-MAX_POLL_DURATION_SECONDS = 300  # Max 5 minutes polling
+MAX_POLL_DURATION_SECONDS = 20  # Also bounded by the shared enrichment deadline
 
 
 # =============================================================================
@@ -53,7 +52,7 @@ def _get_firestore_client():
     try:
         return firestore.client()
     except Exception as e:
-        logger.warning("firestore_client_unavailable", error=str(e))
+        logger.warning("firestore_client_unavailable", error=safe_error_text(e))
         return None
 
 
@@ -66,7 +65,18 @@ def _build_function_url(function_name: str) -> str:
     Returns:
         Full URL to the function endpoint
     """
-    return f"{FUNCTIONS_BASE_URL}/{function_name}"
+    from config.production import is_production, require_https_url
+    if is_production():
+        if function_name != 'comparePrices':
+            raise ValueError('Unsupported private pricing operation')
+        return require_https_url(os.getenv('PRICING_SERVICE_URL'), 'PRICING_SERVICE_URL')
+    project = settings.firebase_project_id or os.getenv("GCLOUD_PROJECT") or "collabcanvas-dev"
+    local = (settings.use_firebase_emulators or
+             bool(os.getenv("FIRESTORE_EMULATOR_HOST")) or
+             os.getenv("FUNCTIONS_EMULATOR", "false").lower() == "true")
+    base = (f"http://127.0.0.1:5001/{project}/us-central1" if local else
+            f"https://us-central1-{project}.cloudfunctions.net")
+    return f"{base}/{function_name}"
 
 
 async def _call_cloud_function(
@@ -97,11 +107,16 @@ async def _call_cloud_function(
         data_keys=list(data.keys())
     )
     
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    from config.production import is_production
+    headers = {"Content-Type": "application/json"}
+    if is_production():
+        from services.service_identity import service_headers
+        headers = await service_headers(url)
+    async with httpx.AsyncClient(timeout=timeout, trust_env=False, follow_redirects=False) as client:
         response = await client.post(
             url,
             json=data,
-            headers={"Content-Type": "application/json"}
+            headers=headers
         )
         response.raise_for_status()
         return response.json()
@@ -131,11 +146,14 @@ async def _poll_firestore_for_completion(
     doc_ref = db.collection("projects").document(project_id) \
         .collection("priceComparison").document("latest")
     
-    start_time = time.time()
+    start_time = time.monotonic()
     
-    while time.time() - start_time < max_duration:
+    while time.monotonic() - start_time < max_duration:
         try:
-            doc = doc_ref.get()
+            remaining = max_duration - (time.monotonic() - start_time)
+            doc = await bounded_storage_call(
+                lambda: doc_ref.get(retry=None, timeout=min(2.0, remaining))
+            )
             if not doc.exists:
                 await asyncio.sleep(POLL_INTERVAL_SECONDS)
                 continue
@@ -168,7 +186,7 @@ async def _poll_firestore_for_completion(
             logger.warning(
                 "firestore_poll_error",
                 project_id=project_id,
-                error=str(e)
+                error=safe_error_text(e)
             )
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
     
@@ -245,6 +263,31 @@ async def get_material_prices(
     product_names: List[str],
     project_id: str,
     zip_code: Optional[str] = None,
+    force_refresh: bool = False,
+) -> Dict[str, float]:
+    """Bound the complete invocation/read sequence; isolate late Node results.
+
+    Node's callable responds after processing, not on job acceptance. A timeout
+    therefore falls back immediately. Its late writes stay in this invocation's
+    comparison document and cannot be consumed by a newer Cost attempt.
+    """
+    if not product_names or not project_id:
+        return {}
+    comparison_id = f"{project_id}--pricing-{uuid4().hex}"
+    try:
+        async with asyncio.timeout(settings.price_enrichment_budget_seconds):
+            return await _get_material_prices(
+                product_names, comparison_id, zip_code, force_refresh
+            )
+    except TimeoutError:
+        logger.warning("price_enrichment_budget_exhausted")
+        return {}
+
+
+async def _get_material_prices(
+    product_names: List[str],
+    project_id: str,
+    zip_code: Optional[str] = None,
     force_refresh: bool = False
 ) -> Dict[str, float]:
     """Get material prices from price comparison service.
@@ -305,7 +348,7 @@ async def get_material_prices(
         response = await _call_cloud_function(
             COMPARE_PRICES_FUNCTION,
             function_data,
-            timeout=30.0  # Short timeout for trigger call
+            timeout=FUNCTION_TIMEOUT_SECONDS
         )
         
         # Check if cached results were returned immediately
@@ -350,7 +393,7 @@ async def get_material_prices(
         logger.warning(
             "price_comparison_http_error",
             project_id=project_id,
-            error=str(e),
+            error=safe_error_text(e),
             duration_ms=round(duration_ms, 2)
         )
         return {}
@@ -360,7 +403,7 @@ async def get_material_prices(
         logger.error(
             "price_comparison_unexpected_error",
             project_id=project_id,
-            error=str(e),
+            error=safe_error_text(e),
             duration_ms=round(duration_ms, 2)
         )
         return {}

@@ -4,6 +4,8 @@ Abstract base class for all agents in the deep pipeline.
 Integrates LangChain Deep Agents with A2A Protocol.
 """
 
+from config.safe_logging import safe_error_text
+
 from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional
 from uuid import uuid4
@@ -15,7 +17,7 @@ from langchain_openai import ChatOpenAI
 from services.firestore_service import FirestoreService
 from services.llm_service import LLMService
 from config.settings import settings
-from config.errors import TrueCostError, AgentError, ErrorCode
+from config.errors import TrueCostError, AgentError, ErrorCode, StructuredError
 
 logger = structlog.get_logger()
 
@@ -135,6 +137,9 @@ class BaseA2AAgent(ABC):
             # Extract feedback if present (for retries)
             critic_feedback = data.get("critic_feedback")
             retry_attempt = data.get("retry_attempt", 0)
+            if self.name == "cost":
+                self._attempt_id = data.get("attempt_id")
+                self._attempt_expires_at = data.get("attempt_expires_at", float("inf"))
             
             if not estimate_id:
                 return self._error_response(
@@ -157,7 +162,9 @@ class BaseA2AAgent(ABC):
                 estimate_id,
                 self.name,
                 status="running",
-                retry=retry_attempt if retry_attempt > 0 else None
+                retry=retry_attempt if retry_attempt > 0 else None,
+                **({"attempt_id": self._attempt_id}
+                   if self.name == "cost" and self._attempt_id else {})
             )
             
             # Run the agent's main logic
@@ -188,6 +195,11 @@ class BaseA2AAgent(ABC):
                 request_id=request_id
             )
             
+        except StructuredError as e:
+            logger.warning("agent_execution_failed", agent=self.name, code=e.code)
+            return self._task_failed_response(
+                task_id=task_id, error=e.to_dict(), request_id=request_id
+            )
         except TrueCostError as e:
             logger.error(
                 "agent_error",
@@ -205,11 +217,11 @@ class BaseA2AAgent(ABC):
             logger.exception(
                 "agent_exception",
                 agent=self.name,
-                error=str(e)
+                error=safe_error_text(e)
             )
             return self._task_failed_response(
                 task_id=task_id,
-                error=str(e),
+                error=safe_error_text(e),
                 request_id=request_id
             )
     
@@ -321,7 +333,7 @@ class BaseA2AAgent(ABC):
     def _task_failed_response(
         self,
         task_id: str,
-        error: str,
+        error: Any,
         request_id: str
     ) -> Dict[str, Any]:
         """Build failed task A2A response.
@@ -421,6 +433,4 @@ Please address these issues in your response. Focus on the specific problems ide
         if not fixes:
             return "- No specific fixes suggested"
         return "\n".join(f"- {fix}" for fix in fixes)
-
-
 

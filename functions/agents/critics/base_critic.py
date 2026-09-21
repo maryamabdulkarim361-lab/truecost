@@ -4,6 +4,8 @@ Abstract base class for critic agents that provide qualitative
 feedback when a primary agent's output scores below threshold.
 """
 
+from config.safe_logging import safe_error_text
+
 from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional, List
 from uuid import uuid4
@@ -12,6 +14,7 @@ import structlog
 
 from services.firestore_service import FirestoreService
 from services.llm_service import LLMService
+from config.errors import StructuredError
 from config.settings import settings
 
 logger = structlog.get_logger()
@@ -151,15 +154,20 @@ class BaseCritic(ABC):
                 }
             }
             
+        except StructuredError as e:
+            logger.warning("critic_execution_failed", critic=self.name, code=e.code)
+            return {"jsonrpc": "2.0", "id": request_id, "result": {
+                "task_id": task_id, "status": "failed", "error": e.to_dict()
+            }}
         except Exception as e:
-            logger.exception("critic_error", critic=self.name, error=str(e))
+            logger.exception("critic_error", critic=self.name, error=safe_error_text(e))
             return {
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "result": {
                     "task_id": task_id,
                     "status": "failed",
-                    "error": str(e)
+                    "error": safe_error_text(e)
                 }
             }
     
@@ -232,12 +240,14 @@ Please provide a detailed critique with:
                 "scorer_feedback": scorer_feedback
             }
             
+        except StructuredError:
+            raise
         except Exception as e:
-            # Fall back to analysis if LLM fails
+            # Fall back to analysis for legacy/non-provider failures.
             logger.warning(
                 "critic_llm_fallback",
                 critic=self.name,
-                error=str(e)
+                error=safe_error_text(e)
             )
             return {
                 "issues": analysis.get("issues", ["Unable to generate detailed critique"]),
@@ -330,6 +340,5 @@ Be specific and constructive. Focus on issues that would affect:
 - Consistency with input data
 - Compliance with industry standards
 """
-
 
 

@@ -216,6 +216,13 @@
       "base_rate": 30.00,
       "benefits_burden": 0.35,
       "total_rate": 40.50
+    },
+    {
+      "trade": "general_labor",
+      "region": "west",
+      "base_rate": 32.00,
+      "benefits_burden": 0.35,
+      "total_rate": 43.20
     }
   ]
 }

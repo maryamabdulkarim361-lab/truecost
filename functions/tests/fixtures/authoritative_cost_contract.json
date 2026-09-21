@@ -1,0 +1,9 @@
+{
+  "baseEstimate": 27942.71,
+  "contingency": 3514.03,
+  "finalEstimate": 31456.74,
+  "totalCost": 31456.74,
+  "p50": 29283.6,
+  "p80": 32797.63,
+  "p90": 35067.77
+}

@@ -4,11 +4,17 @@ Calculates material, labor, and equipment costs with P50/P80/P90 ranges
 for Monte Carlo compatibility.
 """
 
+from config.safe_logging import safe_error_text
+
 from typing import Dict, Any, Optional, List
 import asyncio
 import json
 import math
+import time
 import structlog
+from config.settings import settings
+from config.errors import TrueCostError, ErrorCode
+from services.cost_execution import PriceEnrichmentBudget
 
 from agents.base_agent import BaseA2AAgent
 from services.firestore_service import FirestoreService
@@ -238,6 +244,30 @@ class CostAgent(BaseA2AAgent):
         input_data: Dict[str, Any],
         feedback: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
+        """Cancel and await work before A2A's loop-owned LLM cleanup runs."""
+        remaining = min(
+            settings.cost_execution_budget_seconds,
+            getattr(self, "_attempt_expires_at", float("inf")) - time.time(),
+        )
+        if remaining <= 0:
+            raise TrueCostError(ErrorCode.AGENT_TIMEOUT, "Cost attempt deadline expired")
+        self._price_budget = PriceEnrichmentBudget(
+            settings.price_enrichment_budget_seconds,
+            cost_deadline=time.monotonic() + remaining,
+        )
+        self.cost_data_service.begin_pricing_attempt(self._price_budget)
+        try:
+            async with asyncio.timeout(remaining):
+                return await self._run_cost(estimate_id, input_data, feedback)
+        except TimeoutError as exc:
+            raise TrueCostError(ErrorCode.AGENT_TIMEOUT, "Cost execution budget exhausted") from exc
+
+    async def _run_cost(
+        self,
+        estimate_id: str,
+        input_data: Dict[str, Any],
+        feedback: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
         """Run cost calculation.
         
         Args:
@@ -373,7 +403,8 @@ class CostAgent(BaseA2AAgent):
             summary=summary.headline,
             confidence=confidence,
             tokens_used=self._tokens_used,
-            duration_ms=self.duration_ms
+            duration_ms=self.duration_ms,
+            **({"attempt_id": self._attempt_id} if getattr(self, "_attempt_id", None) else {}),
         )
         
         logger.info(
@@ -484,7 +515,7 @@ Determine the complexity level and project type."""
         except Exception as e:
             logger.warning(
                 "complexity_inference_fallback",
-                error=str(e),
+                error=safe_error_text(e),
                 using_complexity=self._project_complexity.value,
                 using_project_type=self._project_type.value
             )
@@ -571,14 +602,17 @@ Determine the complexity level and project type."""
             # Save granular items for this division in a batch to reduce write calls
             if granular_items:
                 try:
-                    await self.firestore.save_cost_items(estimate_id, granular_items)
+                    await self.firestore.save_cost_items(
+                        estimate_id, granular_items,
+                        **({"attempt_id": self._attempt_id} if getattr(self, "_attempt_id", None) else {}),
+                    )
                 except Exception as e:
                     # Non-fatal: pipeline can still succeed without granular ledger.
                     logger.warning(
                         "save_granular_cost_items_failed",
                         estimate_id=estimate_id,
                         division_code=div_code,
-                        error=str(e)
+                        error=safe_error_text(e)
                     )
             
             # Create division cost
@@ -934,7 +968,7 @@ Determine the complexity level and project type."""
             logger.warning(
                 "line_item_cost_calculation_failed",
                 item_id=item.get("id", "unknown"),
-                error=str(e)
+                error=safe_error_text(e)
             )
             return None, False
     
@@ -1170,7 +1204,7 @@ Please analyze this estimate and provide insights in the required JSON format.""
             logger.warning(
                 "cost_llm_analysis_fallback",
                 estimate_id=estimate_id,
-                error=str(e)
+                error=safe_error_text(e)
             )
             
             return self._generate_fallback_analysis(
@@ -1251,7 +1285,12 @@ Please analyze this estimate and provide insights in the required JSON format.""
 
         try:
             # Search both Home Depot and Lowe's
-            search_result = await self.serper.search_home_depot_and_lowes(search_term)
+            budget = getattr(self, "_price_budget", None)
+            if budget is None:
+                budget = self._price_budget = PriceEnrichmentBudget(settings.price_enrichment_budget_seconds)
+            search_result = await budget.run(
+                lambda: self.serper.search_home_depot_and_lowes(search_term)
+            )
 
             if not search_result:
                 return None
@@ -1306,7 +1345,7 @@ Please analyze this estimate and provide insights in the required JSON format.""
             logger.warning(
                 "google_shopping_search_error",
                 search_term=search_term[:50],
-                error=str(e)
+                error=safe_error_text(e)
             )
             return None
 

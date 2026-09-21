@@ -11,21 +11,21 @@
     </p>
 
     <div class="card">
-        <div class="card-header">Recommended Contingency</div>
+        <div class="card-header">Selected Contingency (% of Base Estimate)</div>
         <div class="stats-grid" style="margin-top: 16px;">
             <div class="stat-card">
-                <div class="stat-value warning">{{ risk_analysis.contingency_pct | default(estimate.contingency_pct) }}%</div>
-                <div class="stat-label">Contingency Allowance</div>
+                <div class="stat-value warning">{{ ("{:.2f}%".format(estimate.contingency_pct) if estimate.contingency_pct is not none else "N/A") }}</div>
+                <div class="stat-label">Allowance / Base Estimate</div>
             </div>
             <div class="stat-card">
-                <div class="stat-value primary">${{ "{:,.0f}".format(risk_analysis.contingency_amount | default(estimate.p80 * estimate.contingency_pct / 100)) }}</div>
-                <div class="stat-label">Amount Recommended</div>
+                <div class="stat-value primary">{{ (estimate.contingency) | money }}</div>
+                <div class="stat-label">Selected Allowance</div>
             </div>
         </div>
 
         <p style="margin-top: 20px;">
             This contingency is <strong>already included</strong> in the total project estimate of
-            <strong>${{ "{:,.0f}".format(estimate.p80) }}</strong> shown on this report.
+            <strong>{{ (estimate.total_cost) | money }}</strong> shown on this report.
         </p>
     </div>
 

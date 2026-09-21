@@ -59,7 +59,10 @@ def get_secret(secret_id: str) -> Optional[str]:
         from google.cloud import secretmanager
 
         client = secretmanager.SecretManagerServiceClient()
-        project_id = os.environ.get('GCLOUD_PROJECT') or os.environ.get('GOOGLE_CLOUD_PROJECT', 'collabcanvas-dev')
+        project_id = (os.environ.get('FIREBASE_PROJECT_ID') or os.environ.get('GCLOUD_PROJECT')
+                      or os.environ.get('GOOGLE_CLOUD_PROJECT'))
+        if not project_id:
+            raise ValueError('Explicit Firebase project required')
         name = f"projects/{project_id}/secrets/{secret_id}/versions/latest"
 
         response = client.access_secret_version(request={"name": name})
@@ -72,7 +75,7 @@ def get_secret(secret_id: str) -> Optional[str]:
         return os.environ.get(secret_id)
 
     except Exception as e:
-        logger.warning(f"Failed to load secret {secret_id} from Secret Manager: {e}")
+        logger.warning("Secret Manager lookup failed; checking configured environment")
         # Fallback to environment variable
         return os.environ.get(secret_id)
 

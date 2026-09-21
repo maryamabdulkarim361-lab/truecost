@@ -1,9 +1,12 @@
 "use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.sendContactEmail = exports.updatePipelineStage = exports.triggerEstimatePipeline = exports.annotationCheckAgent = exports.comparePricesService = exports.comparePrices = exports.estimationPipeline = exports.clarificationAgent = exports.sagemakerInvoke = exports.getHomeDepotPrice = exports.materialEstimateCommand = exports.aiCommand = void 0;
+const productionConfig_1 = require("./productionConfig");
+if ((0, productionConfig_1.isProduction)())
+    (0, productionConfig_1.productionPythonUrl)();
 /**
  * Firebase Cloud Functions Entry Point
  */
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.sendContactEmail = exports.updatePipelineStage = exports.triggerEstimatePipeline = exports.annotationCheckAgent = exports.comparePrices = exports.estimationPipeline = exports.clarificationAgent = exports.sagemakerInvoke = exports.getHomeDepotPrice = exports.materialEstimateCommand = exports.aiCommand = void 0;
 const aiCommand_1 = require("./aiCommand");
 Object.defineProperty(exports, "aiCommand", { enumerable: true, get: function () { return aiCommand_1.aiCommand; } });
 const materialEstimateCommand_1 = require("./materialEstimateCommand");
@@ -18,6 +21,7 @@ const estimationPipeline_1 = require("./estimationPipeline");
 Object.defineProperty(exports, "estimationPipeline", { enumerable: true, get: function () { return estimationPipeline_1.estimationPipeline; } });
 const priceComparison_1 = require("./priceComparison");
 Object.defineProperty(exports, "comparePrices", { enumerable: true, get: function () { return priceComparison_1.comparePrices; } });
+Object.defineProperty(exports, "comparePricesService", { enumerable: true, get: function () { return priceComparison_1.comparePricesService; } });
 const annotationCheckAgent_1 = require("./annotationCheckAgent");
 Object.defineProperty(exports, "annotationCheckAgent", { enumerable: true, get: function () { return annotationCheckAgent_1.annotationCheckAgent; } });
 const estimatePipelineOrchestrator_1 = require("./estimatePipelineOrchestrator");

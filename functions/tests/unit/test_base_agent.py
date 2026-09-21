@@ -239,6 +239,10 @@ class TestBaseCritic:
     @pytest.mark.asyncio
     async def test_handle_critique_request(self, mock_base_critic):
         """Test handling critique request."""
+        mock_base_critic.llm.generate_json = AsyncMock(return_value={
+            "content": {"issues": ["Missing labor rates"], "priority": "high"},
+            "tokens_used": 0,
+        })
         request = {
             "jsonrpc": "2.0",
             "id": "test-id",
@@ -320,6 +324,5 @@ class TestBaseCritic:
         assert "test_agent" in prompt
         assert "JSON" in prompt
         assert "issues" in prompt
-
 
 

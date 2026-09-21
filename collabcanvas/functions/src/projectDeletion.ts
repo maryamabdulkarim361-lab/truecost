@@ -1,3 +1,4 @@
+import {safeLog} from './safeDiagnostics';
 /**
  * Cloud Function to delete project and all subcollections
  * This function recursively deletes all subcollections when a project is deleted
@@ -35,8 +36,8 @@ export async function deleteProjectSubcollections(projectId: string): Promise<vo
   // 4. Recursively delete all documents in subcollections
   // 5. Handle errors gracefully
   
-  console.log(`[TODO] Delete subcollections for project ${projectId}`);
-  console.log('[TODO] This requires Cloud Function deployment with Firebase Admin SDK');
+  safeLog('projectDeletion.log', `[TODO] Delete subcollections for project ${projectId}`);
+  safeLog('projectDeletion.log', '[TODO] This requires Cloud Function deployment with Firebase Admin SDK');
   
   // Placeholder implementation
   // In production, this would be:

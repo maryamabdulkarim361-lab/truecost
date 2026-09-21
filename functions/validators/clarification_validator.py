@@ -8,6 +8,8 @@ different frontend formats to pass through. Strict validation can be enabled
 by setting STRICT_VALIDATION = True.
 """
 
+from config.safe_logging import safe_error_text
+
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
@@ -66,10 +68,10 @@ def validate_clarification_output(data: Dict[str, Any]) -> ValidationResult:
             parsed = ClarificationOutput.model_validate(data)
             return ValidationResult(is_valid=True, errors=[], parsed=parsed, raw_data=data)
         except PydanticValidationError as e:
-            errors = [f"{err['loc']}: {err['msg']}" for err in e.errors()]
+            errors = ["Clarification schema validation failed" for _ in e.errors()]
             return ValidationResult(is_valid=False, errors=errors, parsed=None, raw_data=data)
         except Exception as e:
-            return ValidationResult(is_valid=False, errors=[str(e)], parsed=None, raw_data=data)
+            return ValidationResult(is_valid=False, errors=[safe_error_text(e)], parsed=None, raw_data=data)
     else:
         # Lenient mode: minimal validation for development
         errors = []
@@ -107,7 +109,7 @@ def validate_clarification_output(data: Dict[str, Any]) -> ValidationResult:
             # Log warning but continue with raw data
             logger.warning(
                 "lenient_validation_pydantic_skipped",
-                error=str(e)[:200],
+                error=safe_error_text(e)[:200],
                 keys=list(data.keys()),
                 has_csi_scope=has_csi_scope
             )

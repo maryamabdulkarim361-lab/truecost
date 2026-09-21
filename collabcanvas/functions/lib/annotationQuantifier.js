@@ -1,11 +1,7 @@
 "use strict";
-/**
- * Annotation Quantifier
- * Computes accurate measurements from user annotations using scale
- * Primary source of truth for quantities - LLM is only used for inference/gap-filling
- */
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.buildCSIItemsFromQuantities = exports.buildSpaceModelFromQuantities = exports.computeQuantitiesFromAnnotations = void 0;
+const safeDiagnostics_1 = require("./safeDiagnostics");
 // ===================
 // GEOMETRY CALCULATIONS
 // ===================
@@ -325,7 +321,7 @@ function computeQuantitiesFromAnnotations(annotations) {
     if (result.totalFloorAreaPixels === 0 && shapes.length > 0) {
         result.warnings.push('No floor area measurements found - add polygons in a "Floor" or "Rooms" layer');
     }
-    console.log('[QUANTIFIER] Computed from annotations:', {
+    (0, safeDiagnostics_1.safeLog)('annotationQuantifier.log', '[QUANTIFIER] Computed from annotations:', {
         hasScale: result.hasScale,
         scaleUnit: result.scaleUnit,
         walls: result.walls.length,

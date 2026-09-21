@@ -4,8 +4,11 @@ Coordinates the deep agent pipeline with scorer/critic validation flow.
 Manages agent sequencing, retries, and Firestore updates.
 """
 
+from config.safe_logging import safe_error_text
+
 import asyncio
 import time
+from uuid import uuid4
 from typing import Dict, Any, Optional, List, Tuple, Type
 from datetime import datetime
 import structlog
@@ -20,6 +23,7 @@ from config.errors import (
     A2AError,
     ErrorCode
 )
+from config.errors import StructuredError
 from agents.agent_cards import (
     AGENT_SEQUENCE,
     get_scorer_for_primary,
@@ -187,16 +191,21 @@ class PipelineOrchestrator:
                 )
                 
                 if not success:
+                    execution_error = output.get("executionError")
+                    failure_message = (
+                        f"{execution_error['code']}: {execution_error['message']}"
+                        if execution_error else f"Agent {agent_name} failed after {MAX_RETRIES} retries"
+                    )
                     failed_agent = agent_name
                     pipeline_status.agent_statuses[agent_name] = AgentStatus.FAILED.value
-                    pipeline_status.error = f"Agent {agent_name} failed after {MAX_RETRIES} retries"
+                    pipeline_status.error = failure_message
                     await self._update_pipeline_status(estimate_id, pipeline_status)
 
                     # Log pipeline failure with visual banner
                     log_pipeline_failed(
                         estimate_id=estimate_id,
                         failed_agent=agent_name,
-                        error=f"Failed after {MAX_RETRIES} retries",
+                        error=failure_message,
                         completed_agents=completed_agents
                     )
                     
@@ -210,7 +219,9 @@ class PipelineOrchestrator:
                     # Update estimate status to failed
                     await self.firestore.update_estimate(
                         estimate_id,
-                        {"status": "failed", "error": f"Pipeline failed at {agent_name}"}
+                        {"status": "failed", "error": failure_message,
+                         **({"executionError": execution_error,
+                             "providerRetries": output.get("providerRetries", 0)} if execution_error else {})}
                     )
                     
                     return PipelineResult(
@@ -221,7 +232,7 @@ class PipelineOrchestrator:
                         failed_agent=failed_agent,
                         total_duration_ms=self.elapsed_ms,
                         total_tokens_used=self._total_tokens,
-                        error=f"Agent {agent_name} failed validation"
+                        error=failure_message
                     )
                 
                 # Success - add to context and continue
@@ -310,22 +321,22 @@ class PipelineOrchestrator:
             log_pipeline_failed(
                 estimate_id=estimate_id,
                 failed_agent=pipeline_status.current_agent or "unknown",
-                error=str(e),
+                error=safe_error_text(e),
                 completed_agents=completed_agents
             )
 
             logger.exception(
                 "pipeline_exception",
                 estimate_id=estimate_id,
-                error=str(e)
+                error=safe_error_text(e)
             )
 
-            pipeline_status.error = str(e)
+            pipeline_status.error = safe_error_text(e)
             await self._update_pipeline_status(estimate_id, pipeline_status)
 
             await self.firestore.update_estimate(
                 estimate_id,
-                {"status": "failed", "error": str(e)}
+                {"status": "failed", "error": safe_error_text(e)}
             )
 
             # Sync failure to project pipeline for frontend UI
@@ -337,14 +348,14 @@ class PipelineOrchestrator:
                     completed_agents=completed_agents,
                     progress=pipeline_status.progress,
                     status="error",
-                    error=str(e),
+                    error=safe_error_text(e),
                     user_id=self._user_id,
                     started_at=self._started_at,
                 )
 
             raise PipelineError(
                 code=ErrorCode.PIPELINE_FAILED,
-                message=f"Pipeline failed: {str(e)}",
+                message=f"Pipeline failed: {safe_error_text(e)}",
                 estimate_id=estimate_id,
                 current_agent=pipeline_status.current_agent
             )
@@ -368,7 +379,12 @@ class PipelineOrchestrator:
             Tuple of (success, output).
         """
         retry_count = 0
+        provider_retries = 0
         critic_feedback: Optional[Dict[str, Any]] = None
+
+        def execution_failed(error):
+            pipeline_status.retries[agent_name] = retry_count
+            return False, {"executionError": error.to_dict(), "providerRetries": provider_retries}
         
         while retry_count <= MAX_RETRIES:
             # 1. Run primary agent
@@ -391,12 +407,22 @@ class PipelineOrchestrator:
                     tokens_used=metadata.get('tokens_used', 0)
                 )
 
+            except StructuredError as e:
+                delay = e.details.get("retry_delay")
+                if (e.code == ErrorCode.LLM_RATE_LIMITED and provider_retries == 0
+                        and delay is not None and 0 <= delay <= 15):
+                    provider_retries += 1
+                    logger.warning("provider_retry_scheduled", agent=agent_name,
+                                   code=e.code, retry_delay=max(1.0, delay))
+                    await asyncio.sleep(max(1.0, delay))
+                    continue
+                return execution_failed(e)
             except (A2AError, TrueCostError) as e:
                 # Log agent error with visual banner
                 log_agent_error(
                     agent_name=agent_name,
                     estimate_id=estimate_id,
-                    error=str(e),
+                    error=safe_error_text(e),
                     retry_attempt=retry_count
                 )
 
@@ -405,7 +431,7 @@ class PipelineOrchestrator:
                     estimate_id=estimate_id,
                     agent=agent_name,
                     retry=retry_count,
-                    error=str(e)
+                    error=safe_error_text(e)
                 )
                 retry_count += 1
                 continue
@@ -429,12 +455,14 @@ class PipelineOrchestrator:
                     feedback=score_result.feedback
                 )
 
+            except StructuredError as e:
+                return execution_failed(e)
             except (A2AError, TrueCostError) as e:
                 logger.error(
                     "scorer_agent_error",
                     estimate_id=estimate_id,
                     agent=agent_name,
-                    error=str(e)
+                    error=safe_error_text(e)
                 )
                 # If scorer fails, treat as passing to not block pipeline
                 score_result = AgentScoreResult(
@@ -465,7 +493,9 @@ class PipelineOrchestrator:
                     estimate_id=estimate_id,
                     agent_name=agent_name,
                     output=output,
-                    score=score_result.score
+                    score=score_result.score,
+                    **({"attempt_id": self._last_cost_attempt_id, "allow_inactive": True}
+                         if agent_name == "cost" else {})
                 )
                 return True, output
             
@@ -498,12 +528,14 @@ class PipelineOrchestrator:
                     feedback=critic_feedback
                 )
 
+            except StructuredError as e:
+                return execution_failed(e)
             except (A2AError, TrueCostError) as e:
                 logger.error(
                     "critic_agent_error",
                     estimate_id=estimate_id,
                     agent=agent_name,
-                    error=str(e)
+                    error=safe_error_text(e)
                 )
                 # Generate basic feedback if critic fails
                 critic_feedback = {
@@ -574,11 +606,23 @@ class PipelineOrchestrator:
         if critic_feedback:
             message["critic_feedback"] = critic_feedback
         
-        response = await self.a2a.send_task(
-            target_agent=agent_name,
-            message=message,
-            thread_id=estimate_id
-        )
+        attempt_id = None
+        if agent_name == "cost":
+            attempt_id = self._last_cost_attempt_id = uuid4().hex
+            expires_at = time.time() + settings.cost_execution_budget_seconds
+            await self.firestore.begin_cost_attempt(estimate_id, attempt_id, expires_at)
+            message.update(attempt_id=attempt_id, attempt_expires_at=expires_at)
+        try:
+            response = await self.a2a.send_task(
+                target_agent=agent_name,
+                message=message,
+                thread_id=estimate_id
+            )
+        finally:
+            # Revoke even on timeout/cancellation. This precedes the next retry
+            # and prevents the abandoned standalone handler from completing late.
+            if attempt_id is not None:
+                await self.firestore.end_cost_attempt(estimate_id, attempt_id)
         
         # Extract result data
         result = self.a2a.extract_result_data(response)
@@ -723,95 +767,8 @@ class PipelineOrchestrator:
         return PipelineStatus(**status_data)
 
     def _log_agent_output_summary(self, agent_name: str, output: Dict[str, Any]) -> None:
-        """Log detailed summary of agent output for debugging.
-
-        Args:
-            agent_name: Name of the agent that completed.
-            output: Agent output data.
-        """
-        print(f"\n{'='*60}")
-        print(f"[AGENT OUTPUT] {agent_name.upper()} AGENT COMPLETED")
-        print(f"{'='*60}")
-
-        if agent_name == "location":
-            print(f"  ZIP Code: {output.get('zipCode', 'N/A')}")
-            print(f"  City/State: {output.get('city', 'N/A')}, {output.get('state', 'N/A')}")
-            print(f"  Location Factor: {output.get('locationFactor', 'N/A')}")
-            labor_rates = output.get('laborRates', {})
-            print(f"  Labor Rates:")
-            print(f"    - Electrician: ${labor_rates.get('electrician', 'N/A')}/hr")
-            print(f"    - Plumber: ${labor_rates.get('plumber', 'N/A')}/hr")
-            print(f"    - Carpenter: ${labor_rates.get('carpenter', 'N/A')}/hr")
-            print(f"    - General Labor: ${labor_rates.get('generalLabor', 'N/A')}/hr")
-            print(f"  Confidence: {output.get('confidence', 'N/A')}")
-
-        elif agent_name == "scope":
-            divisions = output.get('divisions', [])
-            print(f"  Total Divisions: {len(divisions)}")
-            total_items = sum(len(d.get('lineItems', [])) for d in divisions)
-            print(f"  Total Line Items: {total_items}")
-            for div in divisions[:5]:  # Show first 5 divisions
-                print(f"    - {div.get('divisionCode', '??')}: {div.get('divisionName', 'Unknown')} ({len(div.get('lineItems', []))} items)")
-            print(f"  Confidence: {output.get('confidence', 'N/A')}")
-
-        elif agent_name == "cost":
-            subtotals = output.get('subtotals', {})
-            total = output.get('total', {})
-            print(f"  COST BREAKDOWN:")
-            materials = subtotals.get('materials', {})
-            labor = subtotals.get('labor', {})
-            print(f"    - Materials: ${materials.get('low', 0):,.2f} - ${materials.get('high', 0):,.2f}")
-            print(f"    - Labor: ${labor.get('low', 0):,.2f} - ${labor.get('high', 0):,.2f}")
-            print(f"    - Total Labor Hours: {subtotals.get('totalLaborHours', 'N/A')}")
-            print(f"  GRAND TOTAL: ${total.get('low', 0):,.2f} - ${total.get('high', 0):,.2f}")
-            print(f"  Items with exact costs: {output.get('itemsWithExactCosts', 'N/A')}")
-            print(f"  Items with estimated costs: {output.get('itemsWithEstimatedCosts', 'N/A')}")
-            print(f"  Confidence: {output.get('confidence', 'N/A')}")
-
-            # Check for mock data indicators
-            divisions = output.get('divisions', [])
-            total_items = sum(len(d.get('lineItems', [])) for d in divisions)
-            exact = output.get('itemsWithExactCosts', 0)
-            estimated = output.get('itemsWithEstimatedCosts', total_items)
-            if total_items > 0:
-                pct_estimated = (estimated / total_items) * 100
-                if pct_estimated > 50:
-                    print(f"  ⚠️  WARNING: {pct_estimated:.0f}% of items using ESTIMATED (mock) costs!")
-
-        elif agent_name == "timeline":
-            tasks = output.get('tasks', [])
-            print(f"  Total Tasks: {len(tasks)}")
-            print(f"  Total Duration: {output.get('totalDuration', 'N/A')} working days")
-            print(f"  Calendar Days: {output.get('totalCalendarDays', 'N/A')}")
-            duration_range = output.get('durationRange', {})
-            print(f"  Duration Range: {duration_range.get('optimistic', 'N/A')} - {duration_range.get('pessimistic', 'N/A')} days")
-            print(f"  Schedule Confidence: {output.get('scheduleConfidence', 'N/A')}")
-            # Show first few tasks
-            for task in tasks[:5]:
-                print(f"    - {task.get('name', 'Unknown')}: {task.get('durationDays', '?')} days ({task.get('primaryTrade', 'N/A')})")
-
-        elif agent_name == "risk":
-            print(f"  Risk Score: {output.get('riskScore', 'N/A')}/100")
-            print(f"  Risk Level: {output.get('riskLevel', 'N/A')}")
-            risks = output.get('risks', [])
-            print(f"  Total Risks Identified: {len(risks)}")
-            for risk in risks[:3]:
-                print(f"    - {risk.get('name', 'Unknown')}: {risk.get('severity', 'N/A')} severity")
-
-        elif agent_name == "final":
-            print(f"  P50 Total: ${output.get('p50', 0):,.2f}")
-            print(f"  P80 Total: ${output.get('p80', 0):,.2f}")
-            print(f"  P90 Total: ${output.get('p90', 0):,.2f}")
-            print(f"  Timeline Weeks: {output.get('timelineWeeks', 'N/A')}")
-            print(f"  Monte Carlo Iterations: {output.get('monteCarloIterations', 'N/A')}")
-
-        else:
-            # Generic logging for other agents
-            print(f"  Output keys: {list(output.keys())}")
-            if 'confidence' in output:
-                print(f"  Confidence: {output.get('confidence')}")
-
-        print(f"{'='*60}\n")
+        """Metadata only; raw agent outputs belong in access-controlled storage."""
+        logger.info("agent_output_summary", agent=agent_name)
 
 
 # Convenience function for Cloud Function entry point
@@ -832,6 +789,5 @@ async def run_deep_pipeline(
     """
     orchestrator = PipelineOrchestrator()
     return await orchestrator.run_pipeline(estimate_id, clarification_output)
-
 
 

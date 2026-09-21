@@ -1,3 +1,5 @@
+import { pythonAuthHeaders } from './pythonAuth';
+import { getPythonFunctionsUrl } from './pythonFunctions';
 /**
  * PDF Service
  * Frontend wrapper for PDF generation Cloud Function
@@ -30,18 +32,6 @@ export interface PDFGenerateResult {
  * Get the Python Functions URL for PDF generation
  * PDF generation runs in the Python backend, not TypeScript Firebase Functions
  */
-function getPythonFunctionsUrl(): string {
-  // Check for explicit Python Functions URL (local development)
-  const pythonUrl = import.meta.env.VITE_PYTHON_FUNCTIONS_URL;
-  if (pythonUrl) {
-    return pythonUrl;
-  }
-
-  // Production: Use Cloud Run or deployed Python functions URL
-  const projectId = import.meta.env.VITE_FIREBASE_PROJECT_ID;
-  return `https://us-central1-${projectId}.cloudfunctions.net`;
-}
-
 /**
  * Generate a PDF estimate document
  * Calls the generate_pdf Cloud Function from Epic 4
@@ -64,9 +54,7 @@ export async function generatePDF(
 
     const response = await fetch(url, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers: await pythonAuthHeaders(),
       body: JSON.stringify({
         estimate_id: estimateId,
         client_ready: clientReady,

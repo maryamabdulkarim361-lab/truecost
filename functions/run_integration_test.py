@@ -471,13 +471,14 @@ async def run_agent_with_validation(
         print(f"\n🔍 Running {agent_name} CRITIC for feedback...")
         try:
             critic = get_critic(agent_name)
-            critic_result = await critic.critique(
-                estimate_id=estimate_id,
-                output=output,
-                input_data=accumulated_context,
-                score=score,
-                scorer_feedback=feedback
-            )
+            async with critic.llm:
+                critic_result = await critic.critique(
+                    estimate_id=estimate_id,
+                    output=output,
+                    input_data=accumulated_context,
+                    score=score,
+                    scorer_feedback=feedback
+                )
             
             critic_feedback = critic_result
             issues = critic_result.get("issues", [])

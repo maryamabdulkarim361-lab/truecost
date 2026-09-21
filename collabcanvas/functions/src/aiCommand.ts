@@ -1,4 +1,6 @@
-import { onCall, HttpsError } from 'firebase-functions/v2/https';
+import {safeLog, safeErrorMessage} from './safeDiagnostics';
+import { HttpsError } from 'firebase-functions/v2/https';
+import { onCall, allowedOrigins } from './functionSecurity';
 import { OpenAI } from 'openai';
 import { z } from 'zod';
 
@@ -9,7 +11,7 @@ function getOpenAI(): OpenAI {
   if (!_openai) {
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
-      console.error('[AI_COMMAND] OPENAI_API_KEY not configured');
+      safeLog('aiCommand.error', '[AI_COMMAND] OPENAI_API_KEY not configured');
       throw new Error('OPENAI_API_KEY not configured');
     }
     _openai = new OpenAI({ apiKey });
@@ -132,7 +134,7 @@ async function parseCommandWithOpenAI(commandText: string) {
   
   // Check cache first
   if (commonCommands[lowerCommand]) {
-    console.log('🚀 Using cached command for:', commandText);
+    safeLog('aiCommand.log', '🚀 Using cached command for:', commandText);
     return {
       ...commonCommands[lowerCommand],
       timestamp: Date.now(),
@@ -176,7 +178,7 @@ Return ONLY the JSON, no other text.`;
     // Validate against schema
     const validated = CommandSchema.parse(parsed);
     
-    console.log('🤖 OpenAI parsed command:', commandText, '→', validated);
+    safeLog('aiCommand.log', '🤖 OpenAI parsed command:', commandText, '→', validated);
     
     return {
       ...validated,
@@ -184,17 +186,18 @@ Return ONLY the JSON, no other text.`;
       commandId: `cmd_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
     };
   } catch (error) {
-    console.error('OpenAI parsing error:', error);
+    safeLog('aiCommand.error', 'OpenAI parsing error:', error);
     throw new Error(`Failed to parse command: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
 export const aiCommand = onCall({
-  cors: true, // Enable CORS for all origins (Firebase Functions v2 handles this automatically)
+  cors: allowedOrigins(), // Enable CORS for all origins (Firebase Functions v2 handles this automatically)
   secrets: ['OPENAI_API_KEY'], // Grant access to OpenAI API key secret
 }, async (request) => {
   try {
-    const { commandText, userId } = request.data;
+    const { commandText } = request.data;
+    const userId = request.auth!.uid;
     
     if (!commandText || !userId) {
       throw new HttpsError('invalid-argument', 'Command text and userId are required');
@@ -214,7 +217,7 @@ export const aiCommand = onCall({
     };
 
   } catch (error) {
-    console.error('AI Command Function Error:', error);
+    safeLog('aiCommand.error', 'AI Command Function Error:', error);
     
     if (error instanceof HttpsError) {
       throw error;
@@ -223,9 +226,9 @@ export const aiCommand = onCall({
     // Handle parsing errors gracefully
     return {
       success: false,
-      message: `Could not understand command: ${error instanceof Error ? error.message : String(error)}`,
+      message: safeErrorMessage(`Could not understand command: ${error instanceof Error ? error.message : String(error)}`),
       executedCommands: [],
-      error: error instanceof Error ? error.message : String(error)
+      error: safeErrorMessage(error instanceof Error ? error.message : String(error))
     };
   }
 });

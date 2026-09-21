@@ -1,3 +1,5 @@
+import { pythonAuthHeaders } from './pythonAuth';
+import { getPythonFunctionsUrl } from './pythonFunctions';
 /**
  * Pipeline Service
  * Handles agent pipeline orchestration for estimate generation
@@ -5,7 +7,7 @@
  */
 
 import { doc, onSnapshot, collection, query, orderBy, limit, getDoc } from 'firebase/firestore';
-import { auth, firestore } from './firebase';
+import { firestore } from './firebase';
 
 /**
  * Pipeline stage names (from Epic 2 deep agent pipeline)
@@ -84,7 +86,7 @@ function mapBackendStage(stage?: string | null): PipelineStageId | null {
 function mapBackendStatus(status?: string): PipelineProgress['status'] {
   if (!status) return 'idle';
   const normalized = status.toLowerCase();
-  if (normalized === 'processing' || normalized === 'running') return 'running';
+  if (normalized === 'processing' || normalized === 'running' || normalized === 'accepted' || normalized === 'queued') return 'running';
   if (normalized === 'completed' || normalized === 'complete' || normalized === 'final') return 'complete';
   if (normalized === 'failed' || normalized === 'error') return 'error';
   return 'idle';
@@ -146,29 +148,19 @@ function decorateCompletedStages(
   return completed;
 }
 
-function getDeepPipelineHttpBaseUrl(): string {
-  const projectId = import.meta.env.VITE_FIREBASE_PROJECT_ID;
-  const override = import.meta.env.VITE_FIREBASE_FUNCTIONS_URL;
-  const region = 'us-central1';
-  const useEmulators = import.meta.env.VITE_USE_FIREBASE_EMULATORS === 'true';
-
-  if (override) {
-    return override.replace(/\/start_deep_pipeline$/, '');
-  }
-
-  if (useEmulators) {
-    // Use localhost (not 127.0.0.1) to reduce cross-origin/CORS friction during local dev.
-    return `http://localhost:5001/${projectId}/${region}`;
-  }
-
-  return `https://${region}-${projectId}.cloudfunctions.net`;
-}
-
-function ensureEstimateId(payload: ClarificationOutputPayload, projectId: string): string {
+async function ensureEstimateId(payload: ClarificationOutputPayload, projectId: string): Promise<string> {
   if (typeof payload.estimateId === 'string' && payload.estimateId.length > 0) {
     return payload.estimateId;
   }
-  const estimateId = `est-${projectId}-${Date.now()}`;
+  const canonical = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(canonical);
+    if (value && typeof value === 'object') return Object.fromEntries(
+      Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => [k, canonical(v)]));
+    return value;
+  };
+  const bytes = new TextEncoder().encode(JSON.stringify(canonical({projectId, clarification:payload})));
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  const estimateId = 'est-' + Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('');
   payload.estimateId = estimateId;
   return estimateId;
 }
@@ -182,25 +174,16 @@ export async function triggerEstimatePipeline(
   clarificationOutput: ClarificationOutputPayload
 ): Promise<{ success: boolean; estimateId?: string; error?: string }> {
   try {
-    const estimateId = ensureEstimateId(clarificationOutput, projectId);
-    const baseUrl = getDeepPipelineHttpBaseUrl();
-
-    let idToken: string | undefined;
-    try {
-      idToken = auth.currentUser ? await auth.currentUser.getIdToken() : undefined;
-    } catch {
-      // Token optional when running against emulator
-    }
+    const estimateId = await ensureEstimateId(clarificationOutput, projectId);
+    const baseUrl = getPythonFunctionsUrl();
 
     const response = await fetch(`${baseUrl}/start_deep_pipeline`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
-      },
+      headers: await pythonAuthHeaders(),
       body: JSON.stringify({
         userId,
         projectId,
+        idempotencyKey: estimateId,
         clarificationOutput,
       }),
     });
@@ -221,7 +204,7 @@ export async function triggerEstimatePipeline(
         component: 'pipelineService',
         projectId,
         httpStatus: response.status,
-        body: data,
+
       });
 
       return { success: false, error: message || 'Failed to start pipeline' };

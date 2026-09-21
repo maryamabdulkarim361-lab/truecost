@@ -37,19 +37,19 @@
 
         <div class="estimate-summary">
             {% if client_ready %}
-            {# Client-ready: Show single authoritative total (P80 as recommended budget) #}
-            <div class="summary-label">Total Project Estimate</div>
-            <div class="total-cost">${{ "{:,.0f}".format(estimate.p80) }}</div>
+            {# Client-ready: Show single authoritative final estimate #}
+            <div class="summary-label">Total Project Cost</div>
+            <div class="total-cost">{{ (estimate.total_cost) | money }}</div>
             {% else %}
             {# Contractor view: Show P50/P80/P90 breakdown #}
-            <div class="summary-label">Estimated Project Cost</div>
-            <div class="total-cost">${{ "{:,.0f}".format(estimate.total_cost) }}</div>
+            <div class="summary-label">Total Project Cost</div>
+            <div class="total-cost">{{ (estimate.total_cost) | money }}</div>
             <div class="confidence-range">
-                <span class="confidence-item"><strong>P50:</strong> ${{ "{:,.0f}".format(estimate.p50) }}</span>
+                <span class="confidence-item"><strong>P50:</strong> {{ estimate.p50 | money }}</span>
                 <span class="confidence-divider">|</span>
-                <span class="confidence-item"><strong>P80:</strong> ${{ "{:,.0f}".format(estimate.p80) }}</span>
+                <span class="confidence-item"><strong>P80:</strong> {{ estimate.p80 | money }}</span>
                 <span class="confidence-divider">|</span>
-                <span class="confidence-item"><strong>P90:</strong> ${{ "{:,.0f}".format(estimate.p90) }}</span>
+                <span class="confidence-item"><strong>P90:</strong> {{ estimate.p90 | money }}</span>
             </div>
             {% endif %}
         </div>

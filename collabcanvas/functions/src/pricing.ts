@@ -1,4 +1,6 @@
-import { onCall, HttpsError } from 'firebase-functions/v2/https';
+import {safeLog, safeErrorMessage} from './safeDiagnostics';
+import { HttpsError } from 'firebase-functions/v2/https';
+import { onCall, allowedOrigins } from './functionSecurity';
 import * as admin from 'firebase-admin';
 import { getFirestore, FieldValue, Firestore } from 'firebase-admin/firestore';
 
@@ -76,12 +78,12 @@ async function fetchFromSerpApi(
   deliveryZip?: string,
   attempt = 1
 ): Promise<{ priceUSD: number | null; link: string | null; error?: string }> {
-  console.log(`[PRICING] fetchFromSerpApi called: query="${query}", store_id="${storeId || 'none'}", delivery_zip="${deliveryZip || 'none'}", attempt=${attempt}`);
+  safeLog('pricing.log', `[PRICING] fetchFromSerpApi called: query="${query}", store_id="${storeId || 'none'}", delivery_zip="${deliveryZip || 'none'}", attempt=${attempt}`);
 
   const apiKey = (process.env.SERP_API_KEY || '').trim();
   if (!apiKey) {
     const error = 'SERP_API_KEY not configured';
-    console.error(`[PRICING] ${error}`);
+    safeLog('pricing.error', `[PRICING] ${error}`);
     return { priceUSD: null, link: null, error };
   }
 
@@ -104,7 +106,7 @@ async function fetchFromSerpApi(
   }
 
   const url = `https://serpapi.com/search.json?${params.toString()}`;
-  console.log(`[PRICING] Making request to SerpAPI (attempt ${attempt})...`);
+  safeLog('pricing.log', `[PRICING] Making request to SerpAPI (attempt ${attempt})...`);
   
   try {
     // Add timeout to fetch call (60 seconds - SerpAPI can be slow, especially for complex searches)
@@ -117,17 +119,17 @@ async function fetchFromSerpApi(
     });
     
     clearTimeout(timeoutId);
-    console.log(`[PRICING] SerpAPI response status: ${res.status}`);
+    safeLog('pricing.log', `[PRICING] SerpAPI response status: ${res.status}`);
     
     if (!res.ok) {
-      const errorText = await res.text();
-      const error = `SerpAPI non-OK response: ${res.status} - ${errorText}`;
-      console.warn(`[PRICING] ${error} (attempt ${attempt}/${MAX_RETRIES})`);
+      const error = 'Pricing provider HTTP failure';
+      safeLog('pricing.provider_http', {status:res.status});
+      safeLog('pricing.warn', `[PRICING] ${error} (attempt ${attempt}/${MAX_RETRIES})`);
       
       // Retry on server errors (5xx) or rate limits (429)
       if ((res.status >= 500 || res.status === 429) && attempt < MAX_RETRIES) {
         const delay = INITIAL_RETRY_DELAY_MS * Math.pow(2, attempt - 1);
-        console.log(`[PRICING] Retrying in ${delay}ms...`);
+        safeLog('pricing.log', `[PRICING] Retrying in ${delay}ms...`);
         await sleep(delay);
         return fetchFromSerpApi(query, storeId, deliveryZip, attempt + 1);
       }
@@ -135,13 +137,13 @@ async function fetchFromSerpApi(
       return { priceUSD: null, link: null, error };
     }
     
-    console.log(`[PRICING] Parsing SerpAPI response...`);
+    safeLog('pricing.log', `[PRICING] Parsing SerpAPI response...`);
     const data = await res.json();
     
     // Check for SerpAPI errors in response
     if (data.error) {
-      const error = `Unable to find price - ${data.error}`;
-      console.warn(`[PRICING] ${error} for query: ${query}`);
+      const error = 'Pricing provider failure';
+      safeLog('pricing.warn', `[PRICING] ${error} for query: ${query}`);
       return { priceUSD: null, link: null, error };
     }
     
@@ -150,8 +152,8 @@ async function fetchFromSerpApi(
     
     if (!Array.isArray(results) || results.length === 0) {
       const error = 'Unable to find price - no products found';
-      console.warn(`[PRICING] ${error} for query: ${query}`);
-      console.log(`[PRICING] Response structure: products=${!!data?.products}, organic_results=${!!data?.organic_results}, total_results=${data?.search_information?.total_results || 'N/A'}`);
+      safeLog('pricing.warn', `[PRICING] ${error} for query: ${query}`);
+      safeLog('pricing.log', `[PRICING] Response structure: products=${!!data?.products}, organic_results=${!!data?.organic_results}, total_results=${data?.search_information?.total_results || 'N/A'}`);
       return { priceUSD: null, link: null, error };
     }
     
@@ -171,34 +173,34 @@ async function fetchFromSerpApi(
     
     if (priceUSD === null) {
       const error = 'Unable to find price - price not available in product listing';
-      console.warn(`[PRICING] ${error} for query: ${query}`);
+      safeLog('pricing.warn', `[PRICING] ${error} for query: ${query}`);
       return { priceUSD: null, link, error };
     }
     
-    console.log(`[PRICING] Successfully fetched price $${priceUSD} for: ${query}`);
+    safeLog('pricing.log', `[PRICING] Successfully fetched price $${priceUSD} for: ${query}`);
     return { priceUSD, link };
   } catch (err) {
     const error = err instanceof Error ? err.message : 'Unknown error';
     const isAbortError = err instanceof Error && err.name === 'AbortError';
     
     if (isAbortError) {
-      console.error(`[PRICING] SerpAPI request timeout (attempt ${attempt}/${MAX_RETRIES})`);
+      safeLog('pricing.error', `[PRICING] SerpAPI request timeout (attempt ${attempt}/${MAX_RETRIES})`);
       // Retry on timeout
       if (attempt < MAX_RETRIES) {
         const delay = INITIAL_RETRY_DELAY_MS * Math.pow(2, attempt - 1);
-        console.log(`[PRICING] Retrying in ${delay}ms...`);
+        safeLog('pricing.log', `[PRICING] Retrying in ${delay}ms...`);
         await sleep(delay);
         return fetchFromSerpApi(query, storeId, deliveryZip, attempt + 1);
       }
       return { priceUSD: null, link: null, error: 'Unable to find price - service timed out after 60 seconds' };
     }
     
-    console.error(`[PRICING] SerpAPI fetch error (attempt ${attempt}/${MAX_RETRIES}):`, error);
+    safeLog('pricing.error', `[PRICING] SerpAPI fetch error (attempt ${attempt}/${MAX_RETRIES}):`, error);
     
     // Retry on network errors
     if (attempt < MAX_RETRIES) {
       const delay = INITIAL_RETRY_DELAY_MS * Math.pow(2, attempt - 1);
-      console.log(`[PRICING] Retrying in ${delay}ms...`);
+      safeLog('pricing.log', `[PRICING] Retrying in ${delay}ms...`);
       await sleep(delay);
       return fetchFromSerpApi(query, storeId, deliveryZip, attempt + 1);
     }
@@ -208,23 +210,23 @@ async function fetchFromSerpApi(
 }
 
 export const getHomeDepotPrice = onCall<{ request: PriceRequest }>({
-  cors: true,
+  cors: allowedOrigins(),
   maxInstances: 20,
   memory: '256MiB',
   timeoutSeconds: 60,
   secrets: ['SERP_API_KEY'], // Required for SerpAPI calls
 }, async (req) => {
-  console.log('[PRICING] Function invoked');
-  console.log('[PRICING] Request data:', JSON.stringify(req.data));
+  safeLog('pricing.log', '[PRICING] Function invoked');
+  safeLog('pricing.log', '[PRICING] Request data:', JSON.stringify(req.data));
   
   try {
     // Log API key status (without exposing the key)
     const apiKeySet = !!process.env.SERP_API_KEY;
-    console.log(`[PRICING] SERP_API_KEY configured: ${apiKeySet ? 'YES' : 'NO'}`);
+    safeLog('pricing.log', `[PRICING] SERP_API_KEY configured: ${apiKeySet ? 'YES' : 'NO'}`);
     
     if (!apiKeySet) {
-      console.error('[PRICING] SERP_API_KEY not found in environment variables');
-      console.error('[PRICING] Make sure .env file exists in functions/ directory with SERP_API_KEY=...');
+      safeLog('pricing.error', '[PRICING] SERP_API_KEY not found in environment variables');
+      safeLog('pricing.error', '[PRICING] Make sure .env file exists in functions/ directory with SERP_API_KEY=...');
       return {
         success: false,
         priceUSD: null,
@@ -236,15 +238,15 @@ export const getHomeDepotPrice = onCall<{ request: PriceRequest }>({
     const { materialName, unit, storeNumber, deliveryZip } = req.data?.request || {} as PriceRequest;
     
     if (!materialName) {
-      console.error('[PRICING] materialName is required');
+      safeLog('pricing.error', '[PRICING] materialName is required');
       throw new HttpsError('invalid-argument', 'materialName is required');
     }
     
-    console.log(`[PRICING] Processing request for: ${materialName}${unit ? ` (${unit})` : ''}`);
+    safeLog('pricing.log', `[PRICING] Processing request for: ${materialName}${unit ? ` (${unit})` : ''}`);
 
     const store = (storeNumber || '3620').toString();
     const key = normalizeKey(materialName, unit);
-    console.log(`[PRICING] Cache key: ${key}, Store: ${store}, Delivery Zip: ${deliveryZip || 'none'}`);
+    safeLog('pricing.log', `[PRICING] Cache key: ${key}, Store: ${store}, Delivery Zip: ${deliveryZip || 'none'}`);
     
     // Map storeNumber to store_id (for now, use storeNumber directly - may need mapping table later)
     // Based on user's successful calls: store_id 2414 corresponds to zip 04401
@@ -253,11 +255,11 @@ export const getHomeDepotPrice = onCall<{ request: PriceRequest }>({
     
     const db = getDb();
     const docRef = db.collection('pricing').doc(store).collection('items').doc(key);
-    console.log(`[PRICING] Checking cache in Firestore...`);
+    safeLog('pricing.log', `[PRICING] Checking cache in Firestore...`);
 
     // Cache lookup with TTL check
     const cached = await docRef.get();
-    console.log(`[PRICING] Cache lookup complete. Exists: ${cached.exists}`);
+    safeLog('pricing.log', `[PRICING] Cache lookup complete. Exists: ${cached.exists}`);
     if (cached.exists) {
       const d = cached.data() as CachedPrice | undefined;
       const updatedAt = d?.updatedAt;
@@ -270,13 +272,13 @@ export const getHomeDepotPrice = onCall<{ request: PriceRequest }>({
         
         if (ageMs < CACHE_TTL_MS) {
           const ageMinutes = Math.round(ageMs / 1000 / 60);
-          console.log(`[PRICING] Cache hit for: ${materialName} (age: ${ageMinutes} minutes)`);
+          safeLog('pricing.log', `[PRICING] Cache hit for: ${materialName} (age: ${ageMinutes} minutes)`);
           
           // Return cached result - check if it's a successful cache or error cache
           const hasValidPrice = d && typeof d.priceUSD === 'number' && d.priceUSD !== null;
           const cachedError = d?.lastError || null;
           
-          console.log(`[PRICING] Cache data:`, { 
+          safeLog('pricing.log', `[PRICING] Cache data:`, {
             hasValidPrice, 
             priceUSD: d?.priceUSD, 
             cachedError,
@@ -287,26 +289,26 @@ export const getHomeDepotPrice = onCall<{ request: PriceRequest }>({
             success: hasValidPrice,
             priceUSD: hasValidPrice ? d.priceUSD : null,
             link: d && d.link ? d.link : null,
-            error: cachedError || (hasValidPrice ? undefined : 'Unable to find price - cached result'),
+            error: cachedError ? safeErrorMessage(cachedError) : (hasValidPrice ? undefined : 'Unable to find price - cached result'),
           };
         } else {
-          console.log(`[PRICING] Cache expired for: ${materialName} (age: ${Math.round(ageMs / 1000 / 60 / 60)} hours)`);
+          safeLog('pricing.log', `[PRICING] Cache expired for: ${materialName} (age: ${Math.round(ageMs / 1000 / 60 / 60)} hours)`);
         }
       }
     }
 
     // Fetch from SerpAPI with retry logic
     const query = unit ? `${materialName} ${unit}` : materialName;
-    console.log(`[PRICING] Fetching from SerpAPI: ${query} (store_id: ${storeId}, delivery_zip: ${deliveryZip || 'none'})`);
+    safeLog('pricing.log', `[PRICING] Fetching from SerpAPI: ${query} (store_id: ${storeId}, delivery_zip: ${deliveryZip || 'none'})`);
     const startTime = Date.now();
     const { priceUSD, link, error } = await fetchFromSerpApi(query, storeId, deliveryZip);
     const fetchTime = Date.now() - startTime;
-    console.log(`[PRICING] SerpAPI fetch complete. Price: ${priceUSD}, Error: ${error || 'none'}, Time: ${fetchTime}ms`);
+    safeLog('pricing.log', `[PRICING] SerpAPI fetch complete. Price: ${priceUSD}, Error: ${error || 'none'}, Time: ${fetchTime}ms`);
     
     const success = priceUSD !== null;
     
     // Log success rate metrics
-    console.log(`[PRICING] Fetch result for "${materialName}": success=${success}, price=${priceUSD}, fetchTime=${fetchTime}ms${error ? `, error=${error}` : ''}`);
+    safeLog('pricing.log', `[PRICING] Fetch result for "${materialName}": success=${success}, price=${priceUSD}, fetchTime=${fetchTime}ms${error ? `, error=${error}` : ''}`);
 
     // Store in cache (even if price is null, to avoid repeated failed requests)
     await docRef.set({
@@ -322,24 +324,24 @@ export const getHomeDepotPrice = onCall<{ request: PriceRequest }>({
 
     return { success, priceUSD, link, error } as PriceResponse;
   } catch (e) {
-    console.error('[PRICING] getHomeDepotPrice error:', e);
-    console.error('[PRICING] Error stack:', e instanceof Error ? e.stack : 'No stack trace');
+    safeLog('pricing.error', '[PRICING] getHomeDepotPrice error:', e);
+    safeLog('pricing.error', '[PRICING] Error stack:', e instanceof Error ? e.stack : 'No stack trace');
     
     // Return error response instead of throwing to ensure CORS headers are sent
     if (e instanceof HttpsError) {
       // For HttpsError, we still need to throw it, but log first
-      console.error('[PRICING] Throwing HttpsError:', e.code, e.message);
+      safeLog('pricing.error', '[PRICING] Throwing HttpsError:', e.code, e.message);
       throw e;
     }
     
     // For other errors, return a proper error response
     const errorMessage = e instanceof Error ? e.message : 'Unknown error occurred';
-    console.error('[PRICING] Returning error response:', errorMessage);
+    safeLog('pricing.error', '[PRICING] Returning error response:', errorMessage);
     return { 
       success: false, 
       priceUSD: null, 
       link: null,
-      error: `Internal error: ${errorMessage}` 
+      error: safeErrorMessage(`Internal error: ${errorMessage}`)
     } as PriceResponse;
   }
 });

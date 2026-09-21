@@ -174,9 +174,9 @@ export function validateClarificationOutput(output: Record<string, unknown>): Va
         severity: 'error',
       });
     } else {
-      const requiredFields = ['fullAddress', 'city', 'state', 'zipCode'];
+      const requiredFields = ['fullAddress', 'streetAddress', 'city', 'state', 'zipCode'];
       for (const field of requiredFields) {
-        if (!location[field]) {
+        if (typeof location[field] !== 'string' || !(location[field] as string).trim()) {
           warnings.push({
             code: 'INCOMPLETE_LOCATION',
             field: `projectBrief.location.${field}`,

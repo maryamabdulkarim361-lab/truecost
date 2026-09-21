@@ -5,6 +5,8 @@ identifies top risk factors, and recommends contingency.
 Includes labor cost simulation and schedule simulation.
 """
 
+from config.safe_logging import safe_error_text
+
 from typing import Any, Dict, List, Optional
 import time
 import json
@@ -238,7 +240,7 @@ class RiskAgent(BaseA2AAgent):
             logger.warning(
                 "market_risk_search_failed_fallback",
                 estimate_id=estimate_id,
-                error=str(e)
+                error=safe_error_text(e)
             )
             market_risks = self._get_default_market_risks()
 
@@ -298,7 +300,7 @@ class RiskAgent(BaseA2AAgent):
                 logger.warning(
                     "labor_simulation_failed",
                     estimate_id=estimate_id,
-                    error=str(e)
+                    error=safe_error_text(e)
                 )
 
         # Run Schedule Monte Carlo simulation
@@ -327,7 +329,7 @@ class RiskAgent(BaseA2AAgent):
                 logger.warning(
                     "schedule_simulation_failed",
                     estimate_id=estimate_id,
-                    error=str(e)
+                    error=safe_error_text(e)
                 )
 
         # Calculate contingency recommendation
@@ -635,7 +637,7 @@ class RiskAgent(BaseA2AAgent):
         except Exception as e:
             logger.warning(
                 "llm_analysis_failed",
-                error=str(e),
+                error=safe_error_text(e),
                 falling_back_to_default=True
             )
             return self._generate_default_analysis(
@@ -800,7 +802,7 @@ Please provide your analysis in the required JSON format."""
         except Exception as e:
             logger.warning(
                 "market_risk_search_error",
-                error=str(e)
+                error=safe_error_text(e)
             )
             return self._get_default_market_risks()
 

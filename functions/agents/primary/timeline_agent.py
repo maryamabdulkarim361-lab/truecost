@@ -16,6 +16,7 @@ import structlog
 from agents.base_agent import BaseA2AAgent
 from services.firestore_service import FirestoreService
 from services.llm_service import LLMService
+from config.errors import ErrorCode, StructuredError
 from models.timeline import (
     CriticalPath,
     DependencyType,
@@ -37,6 +38,10 @@ logger = structlog.get_logger()
 # LLM TASK PLANNING PROMPT (NO HARDCODED TASK LISTS)
 # =============================================================================
 
+# Budget for a multi-trade task/dependency JSON object. Timeline-005 reached
+# the previous 1,400-token completion cap; keep one generation, never repair/retry.
+TIMELINE_TASK_PLAN_MAX_TOKENS = 4096
+
 
 TIMELINE_TASK_PLANNER_PROMPT = """You are a construction scheduling expert for TrueCost.
 
@@ -44,7 +49,7 @@ Your job: generate a project schedule task list based strictly on the provided p
 (user-defined scope + pipeline JSON). Do NOT use hardcoded templates.
 
 Requirements:
-- Output JSON with a top-level key "tasks".
+- For a defensible schedule, output JSON with a nonempty top-level "tasks" array.
 - Each task MUST include:
   - name: string
   - phase: one of ["preconstruction","demolition","site_prep","foundation","framing","rough_in","insulation","drywall","finish","fixtures","punch_list","final_inspection"]
@@ -55,7 +60,10 @@ Requirements:
 Guidelines:
 - Keep dependencies realistic; allow parallel work when safe by not over-linking tasks.
 - Include permitting/lead-time/inspection tasks when appropriate for the given scope.
-- If information is missing, do NOT invent durations. Instead set duration_days to null and explain in "notes".
+- Never invent durations or use null durations.
+- If supplied information cannot support a defensible schedule, return exactly:
+  {"status": "insufficient_information"}
+  Do not include tasks in this response. Do not use this state for provider errors.
 
 Return format:
 {
@@ -125,9 +133,16 @@ class TimelineAgent(BaseA2AAgent):
         location_output = input_data.get("location_output", {})
         cost_output = input_data.get("cost_output", {})
         clarification = input_data.get("clarification_output", {})
+        if not all(isinstance(value, dict) for value in
+                   (scope_output, location_output, cost_output, clarification)):
+            raise StructuredError(ErrorCode.INSUFFICIENT_DATA)
         
         # Get project type
         project_brief = clarification.get("projectBrief", {})
+        if (not isinstance(project_brief, dict)
+                or not isinstance(project_brief.get("timeline", {}), dict)
+                or not isinstance(project_brief.get("scopeSummary", {}), dict)):
+            raise StructuredError(ErrorCode.INSUFFICIENT_DATA)
         project_type = project_brief.get("projectType", "renovation").lower()
         total_sqft = project_brief.get("scopeSummary", {}).get("totalSqft")
         
@@ -146,62 +161,13 @@ class TimelineAgent(BaseA2AAgent):
         # Calculate start date (must come from clarification JSON; do NOT default to "2 weeks from now")
         desired_start = project_brief.get("timeline", {}).get("desiredStart")
         if not (isinstance(desired_start, str) and desired_start.strip()):
-            msg = "Timeline unavailable (missing required projectBrief.timeline.desiredStart)."
-            logger.warning(
-                "timeline_agent_missing_desired_start",
-                estimate_id=estimate_id,
-            )
-            output = {
-                "estimateId": estimate_id,
-                "error": {"code": "INSUFFICIENT_DATA", "message": msg},
-                "tasks": [],
-                "milestones": [],
-                "criticalPath": None,
-                "totalDuration": 0,
-                "totalCalendarDays": 0,
-                "durationRange": {"optimistic": 0, "pessimistic": 0},
-            }
-            await self.firestore.save_agent_output(
-                estimate_id=estimate_id,
-                agent_name=self.name,
-                output=output,
-                summary="Timeline unavailable (missing desiredStart)",
-                confidence=0.0,
-                tokens_used=self._tokens_used,
-                duration_ms=self.duration_ms,
-            )
-            return output
-
+            raise StructuredError(ErrorCode.INSUFFICIENT_DATA)
+        if not isinstance(scope_output.get("divisions"), list) or not scope_output["divisions"]:
+            raise StructuredError(ErrorCode.INSUFFICIENT_DATA)
         try:
-            # Accept ISO date or datetime strings (optionally "Z"-terminated)
             start_date = datetime.fromisoformat(desired_start.strip().replace("Z", ""))
-        except Exception:
-            msg = "Timeline unavailable (invalid desiredStart; must be ISO date/datetime)."
-            logger.warning(
-                "timeline_agent_invalid_desired_start",
-                estimate_id=estimate_id,
-                desired_start=desired_start,
-            )
-            output = {
-                "estimateId": estimate_id,
-                "error": {"code": "INVALID_INPUT", "message": msg},
-                "tasks": [],
-                "milestones": [],
-                "criticalPath": None,
-                "totalDuration": 0,
-                "totalCalendarDays": 0,
-                "durationRange": {"optimistic": 0, "pessimistic": 0},
-            }
-            await self.firestore.save_agent_output(
-                estimate_id=estimate_id,
-                agent_name=self.name,
-                output=output,
-                summary="Timeline unavailable (invalid desiredStart)",
-                confidence=0.0,
-                tokens_used=self._tokens_used,
-                duration_ms=self.duration_ms,
-            )
-            return output
+        except (ValueError, TypeError):
+            raise StructuredError(ErrorCode.INSUFFICIENT_DATA) from None
 
         # Generate task plan via LLM (no hardcoded templates)
         task_specs = await self._generate_task_specs_with_llm(
@@ -213,31 +179,6 @@ class TimelineAgent(BaseA2AAgent):
             location_output=location_output,
             feedback=feedback,
         )
-
-        # If LLM cannot provide durations, do not fabricate: return N/A.
-        if not task_specs:
-            msg = "Timeline unavailable (insufficient data to generate tasks)."
-            logger.warning("timeline_agent_insufficient_data", estimate_id=estimate_id)
-            output = {
-                "estimateId": estimate_id,
-                "error": {"code": "INSUFFICIENT_DATA", "message": msg},
-                "tasks": [],
-                "milestones": [],
-                "criticalPath": None,
-                "totalDuration": 0,
-                "totalCalendarDays": 0,
-                "durationRange": {"optimistic": 0, "pessimistic": 0},
-            }
-            await self.firestore.save_agent_output(
-                estimate_id=estimate_id,
-                agent_name=self.name,
-                output=output,
-                summary="Timeline unavailable (insufficient data)",
-                confidence=0.0,
-                tokens_used=self._tokens_used,
-                duration_ms=self.duration_ms,
-            )
-            return output
 
         tasks = self._build_tasks_from_specs(
             task_specs=task_specs,
@@ -330,6 +271,7 @@ class TimelineAgent(BaseA2AAgent):
         feedback: Optional[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
         """Ask the LLM to generate a task plan (no hardcoded templates)."""
+        failure_stage = "timeline_prompt_construction"
         try:
             user_message = json.dumps(
                 {
@@ -353,36 +295,83 @@ class TimelineAgent(BaseA2AAgent):
                 default=str,
             )
 
+            failure_stage = "provider_request"
             result = await self.llm.generate_json(
                 TIMELINE_TASK_PLANNER_PROMPT,
                 user_message,
-                max_tokens=1400,
+                max_tokens=TIMELINE_TASK_PLAN_MAX_TOKENS,
             )
+            failure_stage = "timeline_processing"
             self._tokens_used += result.get("tokens_used", 0)
-            content = result.get("content") or {}
-            tasks = content.get("tasks") if isinstance(content, dict) else None
+            content = result.get("content")
+            def invalid(reason, path):
+                raise StructuredError(ErrorCode.LLM_INVALID_RESPONSE,
+                                      reason=reason, field_path=path)
+
+            if not isinstance(content, dict):
+                invalid("invalid_type", "response")
+            if "status" in content:
+                if content["status"] != "insufficient_information":
+                    invalid("invalid", "status")
+                if set(content) != {"status"}:
+                    invalid("conflicting_state", "response")
+                raise StructuredError(ErrorCode.INSUFFICIENT_DATA,
+                                      reason="insufficient_scheduling_information",
+                                      field_path="status")
+            if "tasks" not in content:
+                invalid("tasks_missing", "tasks")
+            tasks = content["tasks"]
             if not isinstance(tasks, list):
-                return []
+                invalid("invalid_type", "tasks")
+            if not tasks:
+                invalid("tasks_empty", "tasks")
 
-            # Filter out tasks without numeric durations (do not invent).
-            cleaned: List[Dict[str, Any]] = []
-            for t in tasks:
-                if not isinstance(t, dict):
-                    continue
-                if t.get("duration_days") is None:
-                    continue
-                try:
-                    d = int(t.get("duration_days"))
-                except Exception:
-                    continue
-                if d < 1:
-                    continue
-                cleaned.append(t)
-            return cleaned
+            names = set()
+            for index, task in enumerate(tasks):
+                path = f"tasks[{index}]"
+                if not isinstance(task, dict):
+                    invalid("invalid_type", path)
+                for field in ("name", "duration_days", "phase", "primary_trade", "depends_on"):
+                    if field not in task:
+                        invalid("missing", f"{path}.{field}")
+                name = task["name"]
+                duration = task["duration_days"]
+                if not isinstance(name, str):
+                    invalid("invalid_type", f"{path}.name")
+                if not name.strip():
+                    invalid("blank", f"{path}.name")
+                if name in names:
+                    invalid("duplicate", f"{path}.name")
+                if duration is None:
+                    invalid("null", f"{path}.duration_days")
+                if type(duration) is not int:
+                    invalid("invalid_type", f"{path}.duration_days")
+                if duration < 1:
+                    invalid("out_of_range", f"{path}.duration_days")
+                if not isinstance(task["phase"], str) or task["phase"] not in {p.value for p in PhaseType}:
+                    invalid("invalid", f"{path}.phase")
+                if not isinstance(task["primary_trade"], str):
+                    invalid("invalid_type", f"{path}.primary_trade")
+                if not task["primary_trade"].strip():
+                    invalid("blank", f"{path}.primary_trade")
+                if (not isinstance(task["depends_on"], list)
+                        or any(not isinstance(dep, str) for dep in task["depends_on"])):
+                    invalid("invalid_type", f"{path}.depends_on")
+                names.add(name)
+            for index, task in enumerate(tasks):
+                for dep in task["depends_on"]:
+                    if dep == task["name"]:
+                        invalid("self_dependency", f"tasks[{index}].depends_on")
+                    if dep not in names:
+                        invalid("unknown_task", f"tasks[{index}].depends_on")
+            return tasks
 
-        except Exception as e:
-            logger.warning("timeline_task_plan_llm_failed", estimate_id=estimate_id, error=str(e))
-            return []
+        except StructuredError:
+            raise
+        except Exception:
+            # Never expose raw provider responses or turn failures into no tasks.
+            raise StructuredError(ErrorCode.LLM_PROVIDER_ERROR,
+                                  reason="unclassified_error", failure_stage=failure_stage) from None
 
     def _build_tasks_from_specs(
         self,

@@ -4,6 +4,8 @@ Abstract base class for scorer agents that provide objective
 numerical evaluation (0-100) of primary agent outputs.
 """
 
+from config.safe_logging import safe_error_text
+
 from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional, List
 from uuid import uuid4
@@ -13,6 +15,7 @@ import structlog
 from services.firestore_service import FirestoreService
 from services.llm_service import LLMService
 from config.settings import settings
+from config.errors import StructuredError
 
 logger = structlog.get_logger()
 
@@ -145,15 +148,20 @@ class BaseScorer(ABC):
                 }
             }
             
+        except StructuredError as e:
+            logger.warning("scorer_execution_failed", scorer=self.name, code=e.code)
+            return {"jsonrpc": "2.0", "id": request_id, "result": {
+                "task_id": task_id, "status": "failed", "error": e.to_dict()
+            }}
         except Exception as e:
-            logger.exception("scorer_error", scorer=self.name, error=str(e))
+            logger.exception("scorer_error", scorer=self.name, error=safe_error_text(e))
             return {
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "result": {
                     "task_id": task_id,
                     "status": "failed",
-                    "error": str(e)
+                    "error": safe_error_text(e)
                 }
             }
     
@@ -267,6 +275,5 @@ class BaseScorer(ABC):
             return "Below standard output requiring significant improvements."
         else:
             return "Poor quality output with major issues that must be addressed."
-
 
 

@@ -1,10 +1,14 @@
+import {createHash} from 'node:crypto';
+import {safeLog, safeErrorMessage} from './safeDiagnostics';
+import { isProduction, productionPythonUrl } from './productionConfig';
 /**
  * Estimate Pipeline Orchestrator
  * Dedicated cloud function to trigger and initialize the estimate generation pipeline.
  * Story: 6-2 - Two-phase UI with progress tracking
  */
 
-import { onCall, HttpsError } from 'firebase-functions/v2/https';
+import { HttpsError } from 'firebase-functions/v2/https';
+import { onCall, allowedOrigins } from './functionSecurity';
 import { getFirestore, FieldValue, Firestore } from 'firebase-admin/firestore';
 import { initializeApp, getApps } from 'firebase-admin/app';
 
@@ -58,8 +62,10 @@ const _PIPELINE_STAGES = [
   'cad_analysis',
   'location',
   'scope',
+  'code_compliance',
   'cost',
   'risk',
+  'timeline',
   'final',
 ] as const;
 
@@ -79,73 +85,24 @@ interface PipelineStatus {
 /**
  * Get the Python pipeline URL based on environment
  */
-function getPythonPipelineUrl(): string {
+export function getPythonPipelineUrl(): string {
+  if (isProduction()) return `${productionPythonUrl()}/start_deep_pipeline`;
   // Allow override via environment variable for flexible local dev
   if (process.env.PYTHON_FUNCTIONS_URL) {
-    return `${process.env.PYTHON_FUNCTIONS_URL}/collabcanvas-dev/us-central1/start_deep_pipeline`;
+    const base = process.env.PYTHON_FUNCTIONS_URL.replace(/\/+$/, '').replace(/\/start_deep_pipeline$/, '');
+    const url = new URL(base);
+    const prefix = url.pathname === '/' && ['localhost', '127.0.0.1'].includes(url.hostname)
+      ? `${base}/collabcanvas-dev/us-central1` : base;
+    return `${prefix}/start_deep_pipeline`;
   }
   // Check if we're running in the emulator
   if (process.env.FUNCTIONS_EMULATOR === 'true') {
-    // Python functions run on separate port (5002) to avoid conflict with TS emulator (5001)
+    // Python functions run on separate port (5003) to avoid conflict with TS emulator (5001)
     // Start Python server: cd ../functions && source venv/bin/activate && python serve_local.py
-    return 'http://127.0.0.1:5002/collabcanvas-dev/us-central1/start_deep_pipeline';
+    return 'http://127.0.0.1:5003/collabcanvas-dev/us-central1/start_deep_pipeline';
   }
   // Production URL
   return 'https://us-central1-collabcanvas-dev.cloudfunctions.net/start_deep_pipeline';
-}
-
-/**
- * Build ClarificationOutput v3.0.0 from project context
- * This bridges the TypeScript orchestrator with the Python agent pipeline
- */
-function buildClarificationOutput(
-  context: ProjectContext,
-  pipelineId: string
-): Record<string, unknown> {
-  return {
-    version: '3.0.0',
-    estimateId: pipelineId,
-    timestamp: new Date().toISOString(),
-    project: {
-      name: context.projectName,
-      description: context.projectDescription,
-      type: 'construction', // Default, will be refined by agents
-    },
-    location: {
-      address: '', // To be filled by location agent
-      city: '',
-      state: '',
-      zip: '',
-    },
-    scope: {
-      items: context.scopeItems.map((item) => ({
-        category: item.scope,
-        description: item.description,
-        quantity: 1,
-        unit: 'LS',
-      })),
-      totalArea: 0, // To be calculated from CAD
-    },
-    cadData: {
-      hasBackgroundImage: !!context.backgroundImage,
-      imageUrl: context.backgroundImage?.url || null,
-      imageWidth: context.backgroundImage?.width || 0,
-      imageHeight: context.backgroundImage?.height || 0,
-      annotations: context.shapes.map((shape) => ({
-        id: shape.id,
-        type: shape.type,
-        x: shape.x,
-        y: shape.y,
-        width: shape.w,
-        height: shape.h,
-      })),
-    },
-    metadata: {
-      source: 'typescript-orchestrator',
-      projectId: context.projectId,
-      createdAt: new Date().toISOString(),
-    },
-  };
 }
 
 /**
@@ -214,12 +171,12 @@ async function gatherProjectContext(projectId: string): Promise<ProjectContext> 
  * infrastructure from Epic 2.
  */
 export const triggerEstimatePipeline = onCall({
-  cors: true,
+  cors: allowedOrigins(),
   maxInstances: 10,
   memory: '512MiB', // Increased for context gathering
 }, async (request) => {
   try {
-    const { projectId } = request.data;
+    const { projectId, clarificationOutput: suppliedClarification } = request.data;
 
     // Validate required fields
     if (!projectId) {
@@ -235,6 +192,24 @@ export const triggerEstimatePipeline = onCall({
 
     // Bind userId from authenticated identity - ignore any caller-supplied userId
     const userId = request.auth.uid;
+    if (isProduction()) {
+      if (!suppliedClarification || typeof suppliedClarification !== 'object') {
+        throw new HttpsError('invalid-argument', 'Completed clarification required');
+      }
+      const canonical=(value:any):any=> Array.isArray(value)?value.map(canonical):
+        value && typeof value==='object'?Object.fromEntries(Object.entries(value).sort(([a],[b])=>a.localeCompare(b)).map(([k,v])=>[k,canonical(v)])):value;
+      const key=request.data.idempotencyKey || suppliedClarification.estimateId ||
+        'est-'+createHash('sha256').update(JSON.stringify(canonical({projectId,clarification:suppliedClarification}))).digest('hex');
+      const authorization=request.rawRequest.headers.authorization;
+      if(!authorization || !/^Bearer \S+$/i.test(authorization)) throw new HttpsError('unauthenticated','Caller ID token required');
+      const response=await fetch(getPythonPipelineUrl(),{method:'POST',redirect:'error',
+        signal:AbortSignal.timeout(15000),headers:{'Content-Type':'application/json',Authorization:authorization},
+        body:JSON.stringify({userId,projectId,idempotencyKey:key,clarificationOutput:suppliedClarification})});
+      const result=await response.json();
+      if(response.status!==202 || !result.success || !result.data?.jobId) throw new HttpsError('unavailable','Durable start unavailable');
+      return {...result.data,success:true,pipelineId:result.data.estimateId};
+    }
+
 
     const db = getDb();
 
@@ -251,7 +226,7 @@ export const triggerEstimatePipeline = onCall({
       // Check if user is a collaborator
       const collaborators = projectData?.collaborators || [];
       const isCollaborator = collaborators.some(
-        (c: { id: string }) => c.id === request.auth?.uid
+        (c: { userId: string; role: string }) => c.userId === request.auth?.uid && c.role === 'editor'
       );
       if (!isCollaborator) {
         throw new HttpsError('permission-denied', 'User does not have access to this project');
@@ -259,9 +234,9 @@ export const triggerEstimatePipeline = onCall({
     }
 
     // Gather project context data
-    console.log(`[PIPELINE] Gathering context for project ${projectId}`);
+    safeLog('estimatePipelineOrchestrator.log', `[PIPELINE] Gathering context for project ${projectId}`);
     const projectContext = await gatherProjectContext(projectId);
-    console.log(`[PIPELINE] Context gathered:`, {
+    safeLog('estimatePipelineOrchestrator.log', `[PIPELINE] Context gathered:`, {
       projectName: projectContext.projectName,
       hasBackgroundImage: !!projectContext.backgroundImage,
       scopeItemCount: projectContext.scopeItems.length,
@@ -271,6 +246,12 @@ export const triggerEstimatePipeline = onCall({
     // Generate pipeline ID
     const pipelineId = `pipeline_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     const startedAt = Date.now();
+
+    if (!suppliedClarification || typeof suppliedClarification !== 'object' ||
+        !suppliedClarification.projectBrief || typeof suppliedClarification.projectBrief !== 'object') {
+      throw new HttpsError('invalid-argument', 'A completed clarificationOutput is required');
+    }
+    const clarificationOutput = { ...suppliedClarification, estimateId: pipelineId };
 
     // Initialize pipeline status document with context
     // Start from cad_analysis (clarification runs separately in Annotate phase)
@@ -300,22 +281,26 @@ export const triggerEstimatePipeline = onCall({
       createdAt: FieldValue.serverTimestamp(),
     });
 
-    console.log(`[PIPELINE] Started pipeline ${pipelineId} for project ${projectId}`);
+    safeLog('estimatePipelineOrchestrator.log', `[PIPELINE] Started pipeline ${pipelineId} for project ${projectId}`);
 
     // Trigger the Python deep agent pipeline
     // The Python pipeline will sync progress back to /projects/{projectId}/pipeline/status
     try {
       const pythonPipelineUrl = getPythonPipelineUrl();
-      console.log(`[PIPELINE] Calling Python pipeline at: ${pythonPipelineUrl}`);
+      safeLog('estimatePipelineOrchestrator.log', `[PIPELINE] Calling Python pipeline at: ${pythonPipelineUrl}`);
 
-      // Construct ClarificationOutput v3.0.0 from project context
-      // This bridges the TypeScript orchestrator with the Python agent pipeline
-      const clarificationOutput = buildClarificationOutput(projectContext, pipelineId);
+      // Forward completed clarification; never fabricate agent inputs.
 
+      // Firebase onCall already verified this caller; Python independently verifies the same token.
+      const authorization = request.rawRequest.headers.authorization;
+      if (!authorization || !/^Bearer \S+$/i.test(authorization)) {
+        throw new HttpsError('unauthenticated', 'Caller ID token required');
+      }
       const response = await fetch(pythonPipelineUrl, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          Authorization: authorization,
         },
         body: JSON.stringify({
           userId,
@@ -326,21 +311,22 @@ export const triggerEstimatePipeline = onCall({
 
       const pythonResult = await response.json();
 
-      if (!response.ok) {
-        console.error('[PIPELINE] Python pipeline failed:', pythonResult);
+      if (!response.ok || !pythonResult.success) {
+        safeLog('estimatePipelineOrchestrator.error', '[PIPELINE] Python pipeline failed', {status: response.status});
         // Update status to error but don't throw - let the user see partial progress
         await statusRef.update({
           status: 'error',
-          error: pythonResult.error?.message || 'Python pipeline failed to start',
+          error: safeErrorMessage(pythonResult.error?.message || 'Python pipeline failed to start'),
           updatedAt: FieldValue.serverTimestamp(),
         });
+        throw new HttpsError('internal', 'Python pipeline failed to start');
       } else {
-        console.log('[PIPELINE] Python pipeline started:', pythonResult);
+        safeLog('estimatePipelineOrchestrator.log', '[PIPELINE] Python pipeline started:', pythonResult);
       }
     } catch (pythonError) {
-      console.error('[PIPELINE] Failed to call Python pipeline:', pythonError);
-      // Don't fail the whole function - the status is already created
-      // The debug panel can be used to manually trigger the Python pipeline
+      safeLog('estimatePipelineOrchestrator.error', '[PIPELINE] Failed to call Python pipeline');
+      await statusRef.update({ status: 'error', error: 'Python pipeline failed to start', updatedAt: FieldValue.serverTimestamp() });
+      throw new HttpsError('internal', 'Python pipeline failed to start');
     }
 
     return {
@@ -357,7 +343,7 @@ export const triggerEstimatePipeline = onCall({
     };
 
   } catch (error) {
-    console.error('[PIPELINE] Error starting pipeline:', error);
+    safeLog('estimatePipelineOrchestrator.error', '[PIPELINE] Error starting pipeline');
 
     if (error instanceof HttpsError) {
       throw error;
@@ -365,7 +351,7 @@ export const triggerEstimatePipeline = onCall({
 
     throw new HttpsError(
       'internal',
-      error instanceof Error ? error.message : 'Failed to start pipeline'
+      'Operation failed'
     );
   }
 });
@@ -384,12 +370,13 @@ function isValidPipelineStage(stage: unknown): stage is PipelineStageId {
 }
 
 export const updatePipelineStage = onCall({
-  cors: true,
+  cors: allowedOrigins(),
   maxInstances: 20,
   memory: '256MiB',
 }, async (request) => {
   try {
     const { projectId, completedStage, nextStage, error } = request.data;
+    if(isProduction()) throw new HttpsError('failed-precondition','Durable worker owns production progress');
 
     if (!projectId) {
       throw new HttpsError('invalid-argument', 'Project ID is required');
@@ -405,7 +392,7 @@ export const updatePipelineStage = onCall({
     if (completedStage !== undefined && completedStage !== null && !isValidPipelineStage(completedStage)) {
       throw new HttpsError(
         'invalid-argument',
-        `Invalid completedStage: "${completedStage}". Must be one of: ${VALID_PIPELINE_STAGES.join(', ')}`
+        'Operation failed'
       );
     }
 
@@ -413,7 +400,7 @@ export const updatePipelineStage = onCall({
     if (nextStage !== undefined && nextStage !== null && !isValidPipelineStage(nextStage)) {
       throw new HttpsError(
         'invalid-argument',
-        `Invalid nextStage: "${nextStage}". Must be one of: ${VALID_PIPELINE_STAGES.join(', ')}`
+        'Operation failed'
       );
     }
 
@@ -433,7 +420,7 @@ export const updatePipelineStage = onCall({
       // Check if user is a collaborator
       const collaborators = projectData?.collaborators || [];
       const isCollaborator = collaborators.some(
-        (c: { id: string }) => c.id === request.auth?.uid
+        (c: { userId: string; role: string }) => c.userId === request.auth?.uid && c.role === 'editor'
       );
       if (!isCollaborator) {
         throw new HttpsError('permission-denied', 'User does not have access to this project');
@@ -474,7 +461,7 @@ export const updatePipelineStage = onCall({
 
     await statusRef.update(updateData);
 
-    console.log(`[PIPELINE] Updated stage for project ${projectId}: ${completedStage} -> ${nextStage || 'complete'}`);
+    safeLog('estimatePipelineOrchestrator.log', `[PIPELINE] Updated stage for project ${projectId}: ${completedStage} -> ${nextStage || 'complete'}`);
 
     return {
       success: true,
@@ -484,7 +471,7 @@ export const updatePipelineStage = onCall({
     };
 
   } catch (error) {
-    console.error('[PIPELINE] Error updating stage:', error);
+    safeLog('estimatePipelineOrchestrator.error', '[PIPELINE] Error updating stage:', error);
 
     if (error instanceof HttpsError) {
       throw error;
@@ -492,7 +479,7 @@ export const updatePipelineStage = onCall({
 
     throw new HttpsError(
       'internal',
-      error instanceof Error ? error.message : 'Failed to update pipeline stage'
+      'Operation failed'
     );
   }
 });

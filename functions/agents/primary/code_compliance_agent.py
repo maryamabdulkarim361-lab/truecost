@@ -9,6 +9,8 @@ Notes:
 - Permit fees are estimates based on web search - actual fees must be verified.
 """
 
+from config.safe_logging import safe_error_text
+
 from typing import Any, Dict, List, Optional
 import time
 import json
@@ -303,12 +305,12 @@ class CodeComplianceAgent(BaseA2AAgent):
                 "permit_fee_search_error",
                 city=city,
                 state=state,
-                error=str(e)
+                error=safe_error_text(e)
             )
             return {
                 "fees": self._get_default_permit_fees(state),
                 "source": "default_estimates",
-                "notes": [f"Error searching for permit fees: {str(e)}"],
+                "notes": [f"Error searching for permit fees: {safe_error_text(e)}"],
                 "confidence": "low"
             }
 

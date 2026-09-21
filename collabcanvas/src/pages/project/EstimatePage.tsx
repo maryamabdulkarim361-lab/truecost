@@ -13,6 +13,7 @@
  * - Raw JSON viewer
  */
 
+import { selectEstimateMoney } from "../../utils/estimateMoney";
 import { useState, useEffect, useCallback, useMemo } from "react";
 import { useParams, useNavigate, useLocation } from "react-router-dom";
 import { httpsCallable } from "firebase/functions";
@@ -261,14 +262,15 @@ const transformEstimateToBOM = (
   // Extract cost totals from costOutput.subtotals (the correct backend path!)
   const subtotals = costOutput?.subtotals || {};
   const materialCost =
-    subtotals.materials?.medium || finalOutput?.costBreakdown?.materials || 0;
+    finalOutput?.costBreakdown?.materials ?? subtotals.materials?.low ?? 0;
   const laborCost =
-    subtotals.labor?.medium || finalOutput?.costBreakdown?.labor || 0;
+    finalOutput?.costBreakdown?.labor ?? subtotals.labor?.low ?? 0;
   const equipmentCost =
-    subtotals.equipment?.medium || finalOutput?.costBreakdown?.equipment || 0;
+    finalOutput?.costBreakdown?.equipment ?? subtotals.equipment?.low ?? 0;
   const totalLaborHours = subtotals.totalLaborHours || 0;
 
-  // Get total from costOutput.total (P50/P80/P90 ranges)
+  const money = selectEstimateMoney(estimateData);
+  // Legacy Cost ranges remain historical data, not the authoritative final total.
   const totalCostRange = costOutput?.total || {};
   const totalLow =
     totalCostRange.low || finalOutput?.executiveSummary?.totalCost * 0.9 || 0;
@@ -299,7 +301,7 @@ const transformEstimateToBOM = (
         costOutput?.adjustments?.profit?.medium ||
         (materialCost + laborCost) * 0.1,
       marginTimeSlack: finalOutput?.timeline?.totalDays || 30,
-      total: totalMedium,
+      total: money.finalEstimate ?? totalMedium,
       calculatedAt: now,
     },
     // Store the original deep pipeline data for reference
@@ -929,6 +931,10 @@ export function EstimatePage() {
         );
 
         const resultData = result.data as Record<string, unknown>;
+        const produced = resultData.clarificationOutput as {clarificationStatus?: string; flags?: {userVerificationRequired?: boolean}} | undefined;
+        if (!produced || produced.clarificationStatus !== 'complete' || produced.flags?.userVerificationRequired !== false) {
+          throw new Error('Clarification requires review before an estimate can start.');
+        }
         const finalJSON: ClarificationOutputPayload = {
           estimateId: `est-${projectId}-${Date.now()}`,
           ...(resultData.clarificationOutput || resultData),

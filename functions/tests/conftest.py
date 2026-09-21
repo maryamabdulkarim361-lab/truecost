@@ -70,6 +70,13 @@ def mock_firestore_service(mock_firestore_client):
 # ============================================================================
 
 @pytest.fixture
+def block_network(monkeypatch):
+    def blocked(*args, **kwargs):
+        pytest.fail("External networking is forbidden in this offline test")
+    monkeypatch.setattr('socket.socket.connect', blocked)
+    monkeypatch.setattr('socket.socket.connect_ex', blocked)
+
+@pytest.fixture
 def mock_llm_response():
     """Standard mock LLM response."""
     return {
@@ -439,6 +446,10 @@ def mock_settings():
     """Mock settings for all tests."""
     with patch('config.settings.settings') as mock:
         mock.openai_api_key = "test-api-key"
+        mock.llm_api_key = "test-api-key"
+        mock.llm_key_env = "OPENAI_API_KEY"
+        mock.llm_provider = "openai"
+        mock.llm_client_options = {}
         mock.llm_model = "gpt-4o"
         mock.llm_temperature = 0.1
         mock.use_firebase_emulators = True
@@ -446,8 +457,15 @@ def mock_settings():
         mock.a2a_timeout_seconds = 300
         mock.pipeline_max_retries = 2
         mock.pipeline_passing_score = 80
+        mock.cost_execution_budget_seconds = 240
+        mock.price_enrichment_budget_seconds = 20
         mock.log_level = "INFO"
-        yield mock
-
+        # Modules imported by earlier suites may retain the original Settings
+        # object. Bind this test's fake explicitly; never discover credentials.
+        from contextlib import ExitStack
+        with ExitStack() as stack:
+            if 'services.llm_service' in sys.modules:
+                stack.enter_context(patch('services.llm_service.settings', mock))
+            yield mock
 
 

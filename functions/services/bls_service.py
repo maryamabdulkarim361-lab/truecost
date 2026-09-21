@@ -21,6 +21,8 @@ API Details:
 - Data updated annually (May release)
 """
 
+from config.safe_logging import safe_error_text
+
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 import os
@@ -805,6 +807,7 @@ def calculate_total_rate(base_rate: float, burden_pct: float = DEFAULT_BENEFITS_
 
 
 @retry(
+    reraise=True,
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=10),
     retry=retry_if_exception_type((httpx.HTTPError, httpx.TimeoutException)),
@@ -1071,7 +1074,7 @@ async def get_labor_rates_for_zip(
             "bls_api_failure",
             zip_code=zip_code,
             msa_code=msa_code,
-            error=str(e),
+            error=safe_error_text(e),
             latency_ms=round(latency_ms, 2),
         )
 

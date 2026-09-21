@@ -18,7 +18,15 @@ from pathlib import Path
 from typing import Dict, Any
 
 # These tests require WeasyPrint (and its native deps). Skip cleanly if not installed.
-pytest.importorskip("weasyprint")
+@pytest.fixture(autouse=True)
+def offline_pdf_dependencies(request, block_network):
+    # HTML mapping tests need no native renderer; skip only binary PDF tests.
+    import inspect
+    if "generate_pdf_local(" in inspect.getsource(request.function):
+        try:
+            __import__("weasyprint")
+        except (ImportError, OSError):
+            pytest.skip("WeasyPrint native libraries unavailable")
 
 from services.pdf_generator import (
     PDFGenerationRequest,
@@ -647,7 +655,7 @@ class TestClientReadyMode:
             "cad_data": None,
         }
 
-        # Contractor version should show Overhead & Profit
+        # Incomplete legacy detail must not be presented as a reconciled component table.
         html_contractor = _render_html(
             estimate_data=sample_estimate_data,
             related_data=related_data,
@@ -665,8 +673,9 @@ class TestClientReadyMode:
             estimate_id="test_123",
         )
 
-        # Contractor PDF should mention Overhead & Profit
-        assert "Overhead" in html_contractor, "Contractor PDF should show Overhead & Profit"
+        # No overhead-only value may be labelled as overhead plus profit.
+        assert "Overhead & Profit" not in html_contractor
+        assert "Base Estimate (before contingency)" in html_contractor
 
         # Client PDF should NOT mention Overhead & Profit
         assert "Overhead" not in html_client, "Client PDF should NOT expose Overhead & Profit line"
@@ -688,11 +697,11 @@ class TestClientReadyMode:
             estimate_id="test_123",
         )
 
-        # Client PDF should show "Total Project Estimate" label
-        assert "Total Project Estimate" in html_client, "Client PDF should show single total estimate"
+        # Client PDF should show "Total Project Cost" label
+        assert "Total Project Cost" in html_client, "Client PDF should show single total estimate"
 
-        # The P80 value ($49,850) should be the displayed total
-        assert "$49,850" in html_client, "Client PDF should display P80 as the total estimate"
+        # Authoritative final total; P80 is a separate risk percentile.
+        assert "$45,230" in html_client, "Client PDF should display totalCost"
 
     def test_client_pdf_risk_section_simplified(self, sample_estimate_data):
         """Test: Client PDF risk section is either excluded OR simplified (AC 4.3.12)."""
@@ -749,8 +758,8 @@ class TestClientReadyMode:
             estimate_id="test_123",
         )
 
-        # Cover page should say "Total Project Estimate" not show P50/P80/P90 breakdown
-        assert "Total Project Estimate" in html_client
+        # Cover page should say "Total Project Cost" not show P50/P80/P90 breakdown
+        assert "Total Project Cost" in html_client
         # Should not have the "P50: $ | P80: $ | P90: $" format
         assert "P50:" not in html_client and "P80:" not in html_client
 

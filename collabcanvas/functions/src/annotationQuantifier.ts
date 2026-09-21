@@ -1,3 +1,4 @@
+import {safeLog} from './safeDiagnostics';
 /**
  * Annotation Quantifier
  * Computes accurate measurements from user annotations using scale
@@ -490,7 +491,7 @@ export function computeQuantitiesFromAnnotations(annotations: AnnotationSnapshot
     result.warnings.push('No floor area measurements found - add polygons in a "Floor" or "Rooms" layer');
   }
 
-  console.log('[QUANTIFIER] Computed from annotations:', {
+  safeLog('annotationQuantifier.log', '[QUANTIFIER] Computed from annotations:', {
     hasScale: result.hasScale,
     scaleUnit: result.scaleUnit,
     walls: result.walls.length,

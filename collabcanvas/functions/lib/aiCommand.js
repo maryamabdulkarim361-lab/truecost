@@ -1,7 +1,9 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.aiCommand = void 0;
+const safeDiagnostics_1 = require("./safeDiagnostics");
 const https_1 = require("firebase-functions/v2/https");
+const functionSecurity_1 = require("./functionSecurity");
 const openai_1 = require("openai");
 const zod_1 = require("zod");
 // Lazy initialization to avoid timeout during module load
@@ -10,7 +12,7 @@ function getOpenAI() {
     if (!_openai) {
         const apiKey = process.env.OPENAI_API_KEY;
         if (!apiKey) {
-            console.error('[AI_COMMAND] OPENAI_API_KEY not configured');
+            (0, safeDiagnostics_1.safeLog)('aiCommand.error', '[AI_COMMAND] OPENAI_API_KEY not configured');
             throw new Error('OPENAI_API_KEY not configured');
         }
         _openai = new openai_1.OpenAI({ apiKey });
@@ -125,7 +127,7 @@ async function parseCommandWithOpenAI(commandText) {
     const lowerCommand = commandText.toLowerCase().trim();
     // Check cache first
     if (commonCommands[lowerCommand]) {
-        console.log('🚀 Using cached command for:', commandText);
+        (0, safeDiagnostics_1.safeLog)('aiCommand.log', '🚀 Using cached command for:', commandText);
         return Object.assign(Object.assign({}, commonCommands[lowerCommand]), { timestamp: Date.now(), commandId: `cmd_${Date.now()}_${Math.random().toString(36).substr(2, 9)}` });
     }
     // For more complex commands, use OpenAI with optimized prompt
@@ -159,20 +161,21 @@ Return ONLY the JSON, no other text.`;
         const parsed = JSON.parse(responseText);
         // Validate against schema
         const validated = CommandSchema.parse(parsed);
-        console.log('🤖 OpenAI parsed command:', commandText, '→', validated);
+        (0, safeDiagnostics_1.safeLog)('aiCommand.log', '🤖 OpenAI parsed command:', commandText, '→', validated);
         return Object.assign(Object.assign({}, validated), { timestamp: Date.now(), commandId: `cmd_${Date.now()}_${Math.random().toString(36).substr(2, 9)}` });
     }
     catch (error) {
-        console.error('OpenAI parsing error:', error);
+        (0, safeDiagnostics_1.safeLog)('aiCommand.error', 'OpenAI parsing error:', error);
         throw new Error(`Failed to parse command: ${error instanceof Error ? error.message : String(error)}`);
     }
 }
-exports.aiCommand = (0, https_1.onCall)({
-    cors: true,
+exports.aiCommand = (0, functionSecurity_1.onCall)({
+    cors: (0, functionSecurity_1.allowedOrigins)(),
     secrets: ['OPENAI_API_KEY'], // Grant access to OpenAI API key secret
 }, async (request) => {
     try {
-        const { commandText, userId } = request.data;
+        const { commandText } = request.data;
+        const userId = request.auth.uid;
         if (!commandText || !userId) {
             throw new https_1.HttpsError('invalid-argument', 'Command text and userId are required');
         }
@@ -189,16 +192,16 @@ exports.aiCommand = (0, https_1.onCall)({
         };
     }
     catch (error) {
-        console.error('AI Command Function Error:', error);
+        (0, safeDiagnostics_1.safeLog)('aiCommand.error', 'AI Command Function Error:', error);
         if (error instanceof https_1.HttpsError) {
             throw error;
         }
         // Handle parsing errors gracefully
         return {
             success: false,
-            message: `Could not understand command: ${error instanceof Error ? error.message : String(error)}`,
+            message: (0, safeDiagnostics_1.safeErrorMessage)(`Could not understand command: ${error instanceof Error ? error.message : String(error)}`),
             executedCommands: [],
-            error: error instanceof Error ? error.message : String(error)
+            error: (0, safeDiagnostics_1.safeErrorMessage)(error instanceof Error ? error.message : String(error))
         };
     }
 });

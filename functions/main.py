@@ -32,7 +32,12 @@ from firebase_functions import https_fn, options
 from firebase_admin import initialize_app, firestore
 
 from config.settings import settings
+from config.safe_logging import configure_logging
+configure_logging()
+from config.production import is_production
 from config.errors import TrueCostError, ErrorCode, ValidationError
+from services.request_auth import user_endpoint, current_uid
+from services.durable_http import route_start, http_entry
 from services.firestore_service import FirestoreService
 from validators.clarification_validator import validate_clarification_output
 
@@ -109,37 +114,18 @@ def get_request_json(req: https_fn.Request) -> Dict[str, Any]:
         # Log the error but return empty dict for resilience
         logger.warning(
             "json_parse_error",
-            error=str(e),
+            error="Internal operation failed",
             method=req.method,
             path=req.path
         )
         raise ValidationError(
-            message=f"Invalid JSON in request body: {str(e)}"
+            message="Invalid JSON in request body"
         )
 
 
 def get_user_id(req: https_fn.Request) -> str:
-    """Extract user ID from request.
-    
-    In production, this would validate the Firebase Auth token.
-    For now, we accept userId in the request body.
-    
-    Args:
-        req: HTTP request object.
-        
-    Returns:
-        User ID string.
-    """
-    data = get_request_json(req)
-    user_id = data.get("userId")
-    
-    if not user_id:
-        raise ValidationError(
-            message="Missing userId in request",
-            field="userId"
-        )
-    
-    return user_id
+    """Identity comes only from the verified request context."""
+    return current_uid()
 
 
 # ============================================================================
@@ -152,18 +138,15 @@ def get_user_id(req: https_fn.Request) -> str:
     memory=options.MemoryOption.GB_1,
     region="us-central1"
 )
+@route_start
+@user_endpoint("start")
 def start_deep_pipeline(req: https_fn.Request) -> https_fn.Response:
-    """Start the deep agent pipeline.
-    
-    This endpoint:
-    1. Validates the ClarificationOutput
-    2. Creates the estimate document
-    3. Starts the pipeline asynchronously
-    4. Returns immediately with the estimate ID
-    
-    The pipeline runs in the background (5-15 minutes).
-    Frontend should listen to Firestore for progress updates.
-    
+    """Start an estimate using the configured execution mode.
+
+    Production requests are routed by route_start to durable job creation and
+    HTTP 202, without executing agents. This body preserves synchronous local
+    development execution and waits for that pipeline's result.
+
     Request body:
     {
         "userId": "user-123",
@@ -185,7 +168,7 @@ def start_deep_pipeline(req: https_fn.Request) -> https_fn.Response:
     
     try:
         data = get_request_json(req)
-        user_id = data.get("userId")
+        user_id = get_user_id(req)
         project_id = data.get("projectId")  # Optional: for UI sync
         clarification_output = data.get("clarificationOutput")
 
@@ -260,11 +243,11 @@ def start_deep_pipeline(req: https_fn.Request) -> https_fn.Response:
             status=500
         )
     except Exception as e:
-        logger.exception("pipeline_start_exception", error=str(e))
+        logger.error("pipeline_start_exception", error="Internal operation failed")
         return _json_response(
             error_response(
                 ErrorCode.PIPELINE_FAILED,
-                f"Failed to start pipeline: {str(e)}"
+                "Failed to start pipeline"
             ),
             status=500
         )
@@ -297,7 +280,8 @@ async def _start_pipeline_async(
     await firestore_service.create_estimate(
         estimate_id=estimate_id,
         user_id=user_id,
-        clarification_output=clarification_output
+        clarification_output=clarification_output,
+        create_only=True,
     )
 
     # Run pipeline to completion
@@ -317,15 +301,15 @@ async def _start_pipeline_async(
             "totalDurationMs": result.total_duration_ms
         }
     except Exception as e:
-        logger.exception(
+        logger.error(
             "pipeline_error",
             estimate_id=estimate_id,
-            error=str(e)
+            error="Internal operation failed"
         )
         return {
             "estimateId": estimate_id,
             "status": "failed",
-            "error": str(e)
+            "error": "Internal operation failed"
         }
 
 
@@ -334,6 +318,7 @@ async def _start_pipeline_async(
     memory=options.MemoryOption.MB_256,
     region="us-central1"
 )
+@user_endpoint("read")
 def get_pipeline_status(req: https_fn.Request) -> https_fn.Response:
     """Get current pipeline status.
     
@@ -382,11 +367,11 @@ def get_pipeline_status(req: https_fn.Request) -> https_fn.Response:
             status=404 if e.code == ErrorCode.ESTIMATE_NOT_FOUND else 500
         )
     except Exception as e:
-        logger.exception("get_status_error", error=str(e))
+        logger.error("get_status_error", error="Internal operation failed")
         return _json_response(
             error_response(
                 ErrorCode.FIRESTORE_ERROR,
-                f"Failed to get status: {str(e)}"
+                "Failed to get status"
             ),
             status=500
         )
@@ -436,7 +421,7 @@ async def _get_status_async(estimate_id: str) -> Dict[str, Any]:
                 "items": cost_items,
             }
     except Exception as e:
-        logger.warning("cost_items_attach_failed", estimate_id=estimate_id, error=str(e))
+        logger.warning("cost_items_attach_failed", estimate_id=estimate_id, error="Internal operation failed")
     
     # Include final estimate data if pipeline is completed
     if status == "completed":
@@ -474,6 +459,7 @@ async def _get_status_async(estimate_id: str) -> Dict[str, Any]:
     memory=options.MemoryOption.MB_256,
     region="us-central1"
 )
+@user_endpoint("delete")
 def delete_estimate(req: https_fn.Request) -> https_fn.Response:
     """Delete an estimate and all subcollections.
     
@@ -495,7 +481,7 @@ def delete_estimate(req: https_fn.Request) -> https_fn.Response:
     try:
         data = get_request_json(req)
         estimate_id = data.get("estimateId")
-        user_id = data.get("userId")
+        user_id = get_user_id(req)
         
         if not estimate_id:
             return _json_response(
@@ -525,11 +511,11 @@ def delete_estimate(req: https_fn.Request) -> https_fn.Response:
             status=404 if e.code == ErrorCode.ESTIMATE_NOT_FOUND else 500
         )
     except Exception as e:
-        logger.exception("delete_estimate_error", error=str(e))
+        logger.error("delete_estimate_error", error="Internal operation failed")
         return _json_response(
             error_response(
                 ErrorCode.FIRESTORE_ERROR,
-                f"Failed to delete estimate: {str(e)}"
+                "Failed to delete estimate"
             ),
             status=500
         )
@@ -571,6 +557,7 @@ async def _delete_estimate_async(estimate_id: str, user_id: str) -> None:
     memory=options.MemoryOption.GB_1,
     region="us-central1"
 )
+@user_endpoint("pdf")
 def generate_pdf(req: https_fn.Request) -> https_fn.Response:
     """Generate PDF estimate report.
 
@@ -640,9 +627,9 @@ def generate_pdf(req: https_fn.Request) -> https_fn.Response:
             status=500
         )
     except Exception as e:
-        logger.exception("pdf_generation_exception", error=str(e))
+        logger.error("pdf_generation_exception", error="Internal operation failed")
         return _json_response(
-            {"success": False, "error": f"Failed to generate PDF: {str(e)}"},
+            {"success": False, "error": "Failed to generate PDF"},
             status=500
         )
 
@@ -663,7 +650,7 @@ async def _generate_pdf_async(
 
 
 CORS_HEADERS = {
-    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Origin": os.getenv("ALLOWED_WEB_ORIGIN", "") if is_production() else "*",
     "Access-Control-Allow-Methods": "POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
     "Access-Control-Max-Age": "3600"
@@ -713,6 +700,7 @@ def _json_response(data: dict, status: int = 200) -> https_fn.Response:
 
 # Agent endpoint configuration
 AGENT_ENDPOINT_CONFIG = {
+    "invoker": "private",  # Deployed A2A requires IAM service identity; standalone stays loopback-only.
     "timeout_sec": 300,  # 5 minutes per agent
     "memory": options.MemoryOption.GB_1,
     "region": "us-central1"
@@ -731,7 +719,8 @@ def _create_a2a_handler(agent_class, agent_name: str):
     """
     async def _handle_request(request_data: Dict[str, Any]) -> Dict[str, Any]:
         agent = agent_class()
-        return await agent.handle_a2a_request(request_data)
+        async with agent.llm:
+            return await agent.handle_a2a_request(request_data)
     
     def handler(req: https_fn.Request) -> https_fn.Response:
         if req.method == "OPTIONS":
@@ -743,12 +732,12 @@ def _create_a2a_handler(agent_class, agent_name: str):
             
             return _json_response(result)
         except Exception as e:
-            logger.exception(f"a2a_{agent_name}_error", error=str(e))
+            logger.error(f"a2a_{agent_name}_error", error="Internal operation failed")
             return _json_response(
                 {
                     "jsonrpc": "2.0",
                     "id": data.get("id", "unknown"),
-                    "error": {"code": -32603, "message": str(e)}
+                    "error": {"code": -32603, "message": "Internal operation failed"}
                 },
                 status=500
             )
@@ -927,19 +916,29 @@ def _handle_a2a_request(
     if req.method == "OPTIONS":
         return _cors_response()
     
+    # Internal clients do not send browser Origin headers. Prevent drive-by
+    # browser requests against the loopback development server.
+    if getattr(req, "headers", {}).get("Origin"):
+        return _json_response({"error":{"code":403,"message":"Internal endpoint"}}, status=403)
     try:
         data = get_request_json(req)
+        if (req.method != "POST" or not isinstance(data, dict)
+                or data.get("jsonrpc") != "2.0" or data.get("method") != "message/send"
+                or not isinstance(data.get("params"), dict)):
+            return _json_response({"jsonrpc":"2.0", "id":None,
+                                   "error":{"code":-32600,"message":"Invalid request"}}, status=400)
         
         async def _process():
             agent = agent_class()
-            return await agent.handle_a2a_request(data)
+            async with agent.llm:
+                return await agent.handle_a2a_request(data)
         
         result = asyncio.run(_process())
         
         return _json_response(result)
         
     except Exception as e:
-        logger.exception(f"a2a_{agent_name}_error", error=str(e))
+        logger.error(f"a2a_{agent_name}_error", error="Internal operation failed")
         request_id = "unknown"
         try:
             request_id = get_request_json(req).get("id", "unknown")
@@ -950,8 +949,33 @@ def _handle_a2a_request(
             {
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "error": {"code": -32603, "message": str(e)}
+                "error": {"code": -32603, "message": "Internal operation failed"}
             },
             status=500
         )
 
+
+
+@https_fn.on_request(timeout_sec=420, memory=options.MemoryOption.GB_1, region="us-central1", invoker="private")
+def durable_worker(req: https_fn.Request) -> https_fn.Response:
+    return http_entry('worker', req)
+
+
+@https_fn.on_request(timeout_sec=60, memory=options.MemoryOption.MB_512, region="us-central1", invoker="private")
+def durable_scanner(req: https_fn.Request) -> https_fn.Response:
+    return http_entry('scanner', req)
+
+
+@https_fn.on_request(timeout_sec=15, region="us-central1", invoker="private")
+def production_readiness(req: https_fn.Request) -> https_fn.Response:
+    from services.durable_http import verify_service, service_config
+    from services.readiness import check
+    try:
+        principal, _ = service_config('SCANNER')
+        from config.production import require_https_url
+        audience = require_https_url(os.getenv('READINESS_URL'), 'Readiness URL')
+        verify_service(req, principal, audience)
+    except Exception:
+        return _json_response({'error': {'code':'SERVICE_AUTH_REJECTED'}}, 403)
+    result = check(settings)
+    return _json_response(result, 200 if result['ready'] else 503)

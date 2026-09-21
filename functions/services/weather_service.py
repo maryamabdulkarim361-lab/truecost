@@ -20,6 +20,8 @@ API Details:
 - Data: Historical daily temperature and precipitation
 """
 
+from config.safe_logging import safe_error_text
+
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 import time
@@ -334,6 +336,7 @@ def calculate_outdoor_adjustment(
 
 
 @retry(
+    reraise=True,
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=10),
     retry=retry_if_exception_type((httpx.HTTPError, httpx.TimeoutException)),
@@ -538,7 +541,7 @@ async def get_weather_factors(zip_code: str) -> WeatherFactors:
         logger.warning(
             "weather_api_failure",
             zip_code=zip_code,
-            error=str(e),
+            error=safe_error_text(e),
             latency_ms=round(latency_ms, 2),
         )
         return _get_fallback_weather(zip_code)

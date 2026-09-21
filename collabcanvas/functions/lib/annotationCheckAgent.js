@@ -1,12 +1,14 @@
 "use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.annotationCheckAgent = void 0;
+const safeDiagnostics_1 = require("./safeDiagnostics");
 /**
  * Annotation Check Agent Cloud Function
  * Validates if user has annotated all required fields based on the project scope
  * This is the clarification agent for the annotation workflow
  */
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.annotationCheckAgent = void 0;
 const https_1 = require("firebase-functions/v2/https");
+const functionSecurity_1 = require("./functionSecurity");
 const openai_1 = require("openai");
 // Lazy initialization to avoid timeout during module load
 let _openai = null;
@@ -14,7 +16,7 @@ function getOpenAI() {
     if (!_openai) {
         const apiKey = process.env.OPENAI_API_KEY;
         if (!apiKey) {
-            console.error('[ANNOTATION_CHECK] OPENAI_API_KEY not configured');
+            (0, safeDiagnostics_1.safeLog)('annotationCheckAgent.error', '[ANNOTATION_CHECK] OPENAI_API_KEY not configured');
             throw new Error('OPENAI_API_KEY not configured');
         }
         _openai = new openai_1.OpenAI({ apiKey });
@@ -353,8 +355,8 @@ function formatLayerDetails(layers, scale) {
 // ===================
 // CLOUD FUNCTION
 // ===================
-exports.annotationCheckAgent = (0, https_1.onCall)({
-    cors: true,
+exports.annotationCheckAgent = (0, functionSecurity_1.onCall)({
+    cors: (0, functionSecurity_1.allowedOrigins)(),
     secrets: ['OPENAI_API_KEY'],
     timeoutSeconds: 60,
 }, async (request) => {
@@ -466,7 +468,7 @@ exports.annotationCheckAgent = (0, https_1.onCall)({
         return response;
     }
     catch (error) {
-        console.error('Annotation Check Agent Error:', error);
+        (0, safeDiagnostics_1.safeLog)('annotationCheckAgent.error', 'Annotation Check Agent Error:', error);
         if (error instanceof https_1.HttpsError) {
             throw error;
         }
@@ -485,7 +487,7 @@ exports.annotationCheckAgent = (0, https_1.onCall)({
                 totalWallLength: 0,
                 totalFloorArea: 0,
             },
-            error: error instanceof Error ? error.message : String(error),
+            error: (0, safeDiagnostics_1.safeErrorMessage)(error instanceof Error ? error.message : String(error)),
         };
     }
 });

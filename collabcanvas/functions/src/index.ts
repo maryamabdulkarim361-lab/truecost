@@ -1,3 +1,6 @@
+import { isProduction, productionPythonUrl } from './productionConfig';
+if (isProduction()) productionPythonUrl();
+
 /**
  * Firebase Cloud Functions Entry Point
  */
@@ -8,7 +11,7 @@ import { getHomeDepotPrice } from './pricing';
 import { sagemakerInvoke } from './sagemakerInvoke';
 import { clarificationAgent } from './clarificationAgent';
 import { estimationPipeline } from './estimationPipeline';
-import { comparePrices } from './priceComparison';
+import { comparePrices, comparePricesService } from './priceComparison';
 import { annotationCheckAgent } from './annotationCheckAgent';
 import { triggerEstimatePipeline, updatePipelineStage } from './estimatePipelineOrchestrator';
 import { sendContactEmail } from './sendContactEmail';
@@ -22,6 +25,7 @@ export {
   clarificationAgent,
   estimationPipeline,
   comparePrices,
+  comparePricesService,
   annotationCheckAgent,
   triggerEstimatePipeline,
   updatePipelineStage,

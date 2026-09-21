@@ -5,6 +5,8 @@ against CAD data. Uses LLM to analyze scope completeness and suggest
 missing items.
 """
 
+from config.safe_logging import safe_error_text
+
 from typing import Dict, Any, List, Optional
 import json
 import structlog
@@ -724,7 +726,7 @@ class ScopeAgent(BaseA2AAgent):
                     "searchable_name_generation_failed",
                     batch_start=i,
                     batch_size=len(batch),
-                    error=str(e)
+                    error=safe_error_text(e)
                 )
                 # Generate fallback names for this batch
                 for item in batch:
@@ -847,7 +849,6 @@ class ScopeAgent(BaseA2AAgent):
             total_hours = response.get("total_project_labor_hours", 0)
             total_material_cost = response.get("total_material_cost", 0)
             labor_summary = response.get("labor_summary", {})
-            material_summary = response.get("material_summary", {})
 
             logger.info(
                 "llm_estimates_generated",
@@ -857,29 +858,12 @@ class ScopeAgent(BaseA2AAgent):
                 labor_summary=labor_summary
             )
 
-            # Log the detailed breakdown for debugging
-            print(f"\n{'='*60}")
-            print(f"[LLM MATERIALS & LABOR] Generated for {len(labor_estimates)} items")
-            print(f"{'='*60}")
-            print(f"  Project Type: {project_type}")
-            print(f"  Finish Level: {finish_level}")
-            print(f"  Total Sqft: {total_sqft}")
-            print(f"  TOTAL PROJECT LABOR HOURS: {total_hours}")
-            print(f"  TOTAL MATERIAL COST: ${total_material_cost:,.2f}")
-            print(f"\n  Labor by Trade:")
-            for trade, hours in labor_summary.items():
-                print(f"    - {trade}: {hours} hours")
-            print(f"\n  Materials by Category:")
-            for category, cost in material_summary.items():
-                print(f"    - {category}: ${cost:,.2f}")
-            print(f"{'='*60}\n")
-
             return labor_estimates
 
         except Exception as e:
             logger.warning(
                 "llm_labor_estimate_failed",
-                error=str(e)
+                error=safe_error_text(e)
             )
             # Return empty dict - will fall back to mock data
             return {}
@@ -1175,7 +1159,7 @@ class ScopeAgent(BaseA2AAgent):
             logger.warning(
                 "llm_analysis_fallback",
                 estimate_id=estimate_id,
-                error=str(e)
+                error=safe_error_text(e)
             )
             
             # Return fallback analysis

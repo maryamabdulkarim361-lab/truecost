@@ -1,7 +1,9 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.materialEstimateCommand = void 0;
+const safeDiagnostics_1 = require("./safeDiagnostics");
 const https_1 = require("firebase-functions/v2/https");
+const functionSecurity_1 = require("./functionSecurity");
 const openai_1 = require("openai");
 // Lazy initialization to avoid timeout during module load
 let _openai = null;
@@ -9,7 +11,7 @@ function getOpenAI() {
     if (!_openai) {
         const apiKey = process.env.OPENAI_API_KEY;
         if (!apiKey) {
-            console.error('[MATERIAL_ESTIMATE] OPENAI_API_KEY not configured');
+            (0, safeDiagnostics_1.safeLog)('materialEstimateCommand.error', '[MATERIAL_ESTIMATE] OPENAI_API_KEY not configured');
             throw new Error('OPENAI_API_KEY not configured');
         }
         _openai = new openai_1.OpenAI({ apiKey });
@@ -20,8 +22,8 @@ function getOpenAI() {
  * Material Estimation AI Command
  * Uses OpenAI to parse natural language requests for construction material estimation
  */
-exports.materialEstimateCommand = (0, https_1.onCall)({
-    cors: true,
+exports.materialEstimateCommand = (0, functionSecurity_1.onCall)({
+    cors: (0, functionSecurity_1.allowedOrigins)(),
     maxInstances: 10,
     memory: '512MiB',
     secrets: ['OPENAI_API_KEY'], // Grant access to OpenAI API key secret
@@ -78,7 +80,7 @@ Return ONLY the JSON object with fields they specified, nothing else.`;
         }
         // Parse the JSON response
         const specifications = JSON.parse(responseText);
-        console.log('🤖 OpenAI parsed specifications:', specifications);
+        (0, safeDiagnostics_1.safeLog)('materialEstimateCommand.log', '🤖 OpenAI parsed specifications:', specifications);
         return {
             success: true,
             specifications,
@@ -87,14 +89,14 @@ Return ONLY the JSON object with fields they specified, nothing else.`;
         };
     }
     catch (error) {
-        console.error('Material Estimate AI Error:', error);
+        (0, safeDiagnostics_1.safeLog)('materialEstimateCommand.error', 'Material Estimate AI Error:', error);
         if (error instanceof https_1.HttpsError) {
             throw error;
         }
         return {
             success: false,
-            error: error instanceof Error ? error.message : String(error),
-            message: `Failed to parse request: ${error instanceof Error ? error.message : String(error)}`,
+            error: (0, safeDiagnostics_1.safeErrorMessage)(error instanceof Error ? error.message : String(error)),
+            message: (0, safeDiagnostics_1.safeErrorMessage)(`Failed to parse request: ${error instanceof Error ? error.message : String(error)}`),
         };
     }
 });
@@ -173,7 +175,7 @@ IMPORTANT: Count ALL doors including:
             throw new Error('No response from OpenAI Vision');
         }
         const result = JSON.parse(responseText);
-        console.log('👁️ Vision AI analyzed plan:', result);
+        (0, safeDiagnostics_1.safeLog)('materialEstimateCommand.log', '👁️ Vision AI analyzed plan:', result);
         return {
             success: true,
             visionAnalysis: result,
@@ -182,10 +184,10 @@ IMPORTANT: Count ALL doors including:
         };
     }
     catch (error) {
-        console.error('Vision query error:', error);
+        (0, safeDiagnostics_1.safeLog)('materialEstimateCommand.error', 'Vision query error:', error);
         return {
             success: false,
-            error: error instanceof Error ? error.message : String(error),
+            error: (0, safeDiagnostics_1.safeErrorMessage)(error instanceof Error ? error.message : String(error)),
             message: 'Failed to analyze plan image',
         };
     }

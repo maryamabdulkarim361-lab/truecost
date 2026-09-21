@@ -9,6 +9,8 @@ from agents.agent_cards import AGENT_SEQUENCE
 from models.agent_output import PipelineStatus, AgentStatus, PipelineResult
 from config.errors import PipelineError, A2AError, ErrorCode
 
+pytestmark = pytest.mark.usefixtures("block_network")
+
 
 # ============================================================================
 # Fixtures
@@ -27,6 +29,8 @@ def mock_firestore():
     })
     mock.update_estimate = AsyncMock()
     mock.save_agent_output = AsyncMock()
+    mock.begin_cost_attempt = AsyncMock()
+    mock.end_cost_attempt = AsyncMock()
     mock.delete_estimate = AsyncMock()
     # New: UI sync helper used by orchestrator; must be awaitable in tests.
     mock.sync_to_project_pipeline = AsyncMock()

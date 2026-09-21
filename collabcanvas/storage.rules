@@ -1,23 +1,27 @@
 rules_version = '2';
-
-// Firebase Storage security rules for construction annotation tool
 service firebase.storage {
   match /b/{bucket}/o {
-    // Allow all authenticated users to read and write construction plan images
-    // This enables collaboration - any user can upload and all users can view
-    match /construction-plans/{allPaths=**} {
-      allow read, write: if request.auth != null;
+    // Same owner/editor/viewer policy as Firestore projects. Server reports are
+    // written with Admin SDK; no browser may create or overwrite a report.
+    function member(projectId, editing) {
+      let project = firestore.get(/databases/(default)/documents/projects/$(projectId)).data;
+      return request.auth != null && (project.ownerId == request.auth.uid
+        || (project.get('collaborators', []) is list
+          && (project.get('collaborators', []).hasAny([{'userId': request.auth.uid, 'role': 'editor'}])
+            || (!editing && project.get('collaborators', []).hasAny([{'userId': request.auth.uid, 'role': 'viewer'}])))));
     }
-    
-    // Allow authenticated users to upload/read project plan images
+    // Current FileUpload stores under the verified user's uid. The old optional
+    // canvasId overload has no established ownership model and fails closed.
+    match /construction-plans/{userId}/{fileName} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+    }
     match /projects/{projectId}/plans/{allPaths=**} {
-      allow read, write: if request.auth != null;
+      allow read: if request.auth != null && member(projectId, false);
+      allow write: if request.auth != null && member(projectId, true);
     }
-    
-    // Deny all other access
+    // PDFs use authenticated backend-issued signed links, never client writes.
     match /{allPaths=**} {
       allow read, write: if false;
     }
   }
 }
-

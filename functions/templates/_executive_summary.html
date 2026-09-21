@@ -10,32 +10,32 @@
             {% if client_ready %}
             {# Client view: Clean, authoritative numbers - NO contingency shown (industry practice) #}
             <div class="stat-card">
-                <div class="stat-value success">${{ "{:,.0f}".format(estimate.p80) }}</div>
-                <div class="stat-label">Total Project Estimate</div>
+                <div class="stat-value success">{{ (estimate.total_cost) | money }}</div>
+                <div class="stat-label">Total Project Cost</div>
             </div>
             <div class="stat-card">
                 <div class="stat-value primary">{{ estimate.timeline_weeks }} weeks</div>
                 <div class="stat-label">Estimated Duration</div>
             </div>
-            {% if project.square_footage and project.square_footage > 0 %}
+            {% if project.square_footage and project.square_footage > 0 and estimate.total_cost is not none %}
             <div class="stat-card">
-                <div class="stat-value">${{ "{:,.0f}".format(estimate.p80 / project.square_footage) }}/sf</div>
+                <div class="stat-value">{{ (estimate.total_cost / project.square_footage) | money }}/sf</div>
                 <div class="stat-label">Cost per Sq Ft</div>
             </div>
             {% endif %}
             {% else %}
             {# Contractor view: Full methodology details #}
             <div class="stat-card">
-                <div class="stat-value success">${{ "{:,.0f}".format(estimate.total_cost) }}</div>
-                <div class="stat-label">Total Estimated Cost</div>
+                <div class="stat-value success">{{ (estimate.total_cost) | money }}</div>
+                <div class="stat-label">Total Project Cost</div>
             </div>
             <div class="stat-card">
                 <div class="stat-value primary">{{ estimate.timeline_weeks }} weeks</div>
                 <div class="stat-label">Estimated Duration</div>
             </div>
             <div class="stat-card">
-                <div class="stat-value warning">{{ estimate.contingency_pct }}%</div>
-                <div class="stat-label">Recommended Contingency</div>
+                <div class="stat-value warning">{{ ("{:.2f}%".format(estimate.contingency_pct) if estimate.contingency_pct is not none else "N/A") }}</div>
+                <div class="stat-label">Selected Contingency (% of Base Estimate)</div>
             </div>
             {% endif %}
         </div>
@@ -57,7 +57,7 @@
         </tr>
         <tr>
             <td><strong>Square Footage:</strong></td>
-            <td>{% if project.square_footage and project.square_footage > 0 %}{{ "{:,.0f}".format(project.square_footage) }} sq ft{% else %}N/A{% endif %}</td>
+            <td>{% if project.square_footage and project.square_footage > 0 and estimate.total_cost is not none %}{{ "{:,.0f}".format(project.square_footage) }} sq ft{% else %}N/A{% endif %}</td>
         </tr>
         <tr>
             <td><strong>Scope:</strong></td>
@@ -92,17 +92,17 @@
         <tbody>
             <tr>
                 <td><span class="badge badge-green">P50</span></td>
-                <td class="currency">${{ "{:,.0f}".format(estimate.p50) }}</td>
+                <td class="currency">{{ estimate.p50 | money }}</td>
                 <td>50% probability the actual cost will be at or below this amount (median)</td>
             </tr>
             <tr>
                 <td><span class="badge badge-yellow">P80</span></td>
-                <td class="currency">${{ "{:,.0f}".format(estimate.p80) }}</td>
+                <td class="currency">{{ estimate.p80 | money }}</td>
                 <td>80% probability the actual cost will be at or below this amount (likely)</td>
             </tr>
             <tr>
                 <td><span class="badge badge-red">P90</span></td>
-                <td class="currency">${{ "{:,.0f}".format(estimate.p90) }}</td>
+                <td class="currency">{{ estimate.p90 | money }}</td>
                 <td>90% probability the actual cost will be at or below this amount (conservative)</td>
             </tr>
         </tbody>
@@ -112,7 +112,7 @@
     <h3>Key Cost Drivers</h3>
     <ul>
         {% for driver in estimate.get('cost_drivers', []) %}
-        <li><strong>{{ driver.name }}:</strong> ${{ "{:,.0f}".format(driver.cost) }} ({{ driver.percentage }}% of total)</li>
+        <li><strong>{{ driver.name }}:</strong> {{ (driver.cost) | money }} {% if driver.cost | number is not none and estimate.total_cost is not none and estimate.total_cost > 0 %}({{ "{:.1f}".format((driver.cost | number) / estimate.total_cost * 100) }}% of Total Project Cost){% endif %}</li>
         {% else %}
         <li>Material costs: Largest portion of project budget</li>
         <li>Labor costs: Varies by trade and location</li>

@@ -14,6 +14,8 @@ References:
 - Google Shopping API: https://serper.dev/docs#google-shopping-api
 """
 
+from config.safe_logging import safe_error_text
+
 import asyncio
 import os
 import re
@@ -302,7 +304,7 @@ class SerperService:
             logger.error(
                 "serper_search_error",
                 query=query[:50],
-                error=str(e)
+                error=safe_error_text(e)
             )
             raise
 
@@ -405,7 +407,7 @@ class SerperService:
             logger.error(
                 "serpapi_shopping_error",
                 query=query[:50],
-                error=str(e)
+                error=safe_error_text(e)
             )
             raise
 
@@ -538,7 +540,7 @@ class SerperService:
                     for r in response.results
                 ])
             except Exception as e:
-                logger.warning("permit_search_query_failed", query=query, error=str(e))
+                logger.warning("permit_search_query_failed", query=query, error=safe_error_text(e))
 
         return {
             "location": f"{city}, {state}",
@@ -639,7 +641,7 @@ class SerperService:
                     for r in response.results
                 ])
             except Exception as e:
-                logger.warning("risk_search_query_failed", query=query, error=str(e))
+                logger.warning("risk_search_query_failed", query=query, error=safe_error_text(e))
 
         return {
             "project_type": project_type,

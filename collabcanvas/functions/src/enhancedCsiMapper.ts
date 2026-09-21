@@ -1,3 +1,4 @@
+import {safeLog} from './safeDiagnostics';
 /**
  * Enhanced CSI Mapper
  * Maps computed quantities to comprehensive CSI divisions with intelligent inference
@@ -121,7 +122,7 @@ export function buildEnhancedCSIItems(
   const flooringType = cc.details?.flooringType;
   const paintType = cc.details?.paintType || 'latex paint';
   
-  console.log('[CSI MAPPER] Clarification context applied:', {
+  safeLog('enhancedCsiMapper.log', '[CSI MAPPER] Clarification context applied:', {
     exclusions: Object.keys(cc.exclusions || {}),
     inclusions: Object.keys(cc.inclusions || {}),
     demolitionArea,
@@ -246,7 +247,7 @@ export function buildEnhancedCSIItems(
       });
     }
   } else {
-    console.log('[CSI MAPPER] Demolition excluded per clarification context');
+    safeLog('enhancedCsiMapper.log', '[CSI MAPPER] Demolition excluded per clarification context');
   }
 
   // ===================
@@ -562,7 +563,7 @@ export function buildEnhancedCSIItems(
         });
       }
     } else {
-      console.log('[CSI MAPPER] Ceiling work excluded per clarification context');
+      safeLog('enhancedCsiMapper.log', '[CSI MAPPER] Ceiling work excluded per clarification context');
     }
 
     // Tile for wet areas
@@ -815,7 +816,7 @@ export function buildEnhancedCSIItems(
       });
     }
   } else {
-    console.log('[CSI MAPPER] Plumbing work excluded per clarification context');
+    safeLog('enhancedCsiMapper.log', '[CSI MAPPER] Plumbing work excluded per clarification context');
   }
 
   // ===================
@@ -837,7 +838,7 @@ export function buildEnhancedCSIItems(
       });
     }
   } else {
-    console.log('[CSI MAPPER] HVAC work excluded per clarification context');
+    safeLog('enhancedCsiMapper.log', '[CSI MAPPER] HVAC work excluded per clarification context');
   }
 
   // ===================
@@ -921,7 +922,7 @@ export function buildEnhancedCSIItems(
       });
     }
   } else {
-    console.log('[CSI MAPPER] Electrical work excluded per clarification context');
+    safeLog('enhancedCsiMapper.log', '[CSI MAPPER] Electrical work excluded per clarification context');
   }
 
   return items;

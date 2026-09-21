@@ -1,11 +1,13 @@
 "use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.clarificationAgent = void 0;
+const safeDiagnostics_1 = require("./safeDiagnostics");
 /**
  * Clarification Agent Cloud Function
  * Handles the clarification chat for scope understanding
  */
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.clarificationAgent = void 0;
 const https_1 = require("firebase-functions/v2/https");
+const functionSecurity_1 = require("./functionSecurity");
 const openai_1 = require("openai");
 // Lazy initialization to avoid timeout during module load
 let _openai = null;
@@ -13,7 +15,7 @@ function getOpenAI() {
     if (!_openai) {
         const apiKey = process.env.OPENAI_API_KEY;
         if (!apiKey) {
-            console.error('[CLARIFICATION_AGENT] OPENAI_API_KEY not configured');
+            (0, safeDiagnostics_1.safeLog)('clarificationAgent.error', '[CLARIFICATION_AGENT] OPENAI_API_KEY not configured');
             throw new Error('OPENAI_API_KEY not configured');
         }
         _openai = new openai_1.OpenAI({ apiKey });
@@ -130,8 +132,8 @@ Format your response as JSON:
   "clarificationComplete": false,
   "completionReason": null
 }`;
-exports.clarificationAgent = (0, https_1.onCall)({
-    cors: true,
+exports.clarificationAgent = (0, functionSecurity_1.onCall)({
+    cors: (0, functionSecurity_1.allowedOrigins)(),
     // Secrets for production; emulator uses .env.local
     secrets: ['OPENAI_API_KEY'],
     timeoutSeconds: 60,
@@ -221,7 +223,7 @@ exports.clarificationAgent = (0, https_1.onCall)({
         return Object.assign({ success: true }, response);
     }
     catch (error) {
-        console.error('Clarification Agent Error:', error);
+        (0, safeDiagnostics_1.safeLog)('clarificationAgent.error', 'Clarification Agent Error:', error);
         if (error instanceof https_1.HttpsError) {
             throw error;
         }
@@ -232,7 +234,7 @@ exports.clarificationAgent = (0, https_1.onCall)({
             extractedData: {},
             clarificationComplete: false,
             completionReason: null,
-            error: error instanceof Error ? error.message : String(error),
+            error: (0, safeDiagnostics_1.safeErrorMessage)(error instanceof Error ? error.message : String(error)),
         };
     }
 });

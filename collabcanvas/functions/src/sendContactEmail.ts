@@ -1,3 +1,5 @@
+import {safeLog} from './safeDiagnostics';
+import {allowedOrigins, checkOrigin} from './functionSecurity';
 /**
  * Cloud Function to send contact form emails
  * Uses Resend API to send to all team members
@@ -8,7 +10,7 @@ import { Resend } from 'resend';
 
 // CORS configuration
 const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Origin': typeof allowedOrigins()[0] === 'string' ? String(allowedOrigins()[0]) : '',
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type',
 };
@@ -36,14 +38,16 @@ export const sendContactEmail = functions
     secrets: ['RESEND_API_KEY'],
   })
   .https.onRequest(async (req, res) => {
+    try { checkOrigin(req.headers.origin); } catch { res.status(403).json({error:'Origin not allowed'}); return; }
+    const headers = {...corsHeaders, 'Access-Control-Allow-Origin': req.headers.origin || ''};
     // Handle CORS preflight
     if (req.method === 'OPTIONS') {
-      res.set(corsHeaders);
+      res.set(headers);
       res.status(204).send('');
       return;
     }
 
-    res.set(corsHeaders);
+    res.set(headers);
 
     if (req.method !== 'POST') {
       res.status(405).json({ success: false, error: 'Method not allowed' });
@@ -66,7 +70,7 @@ export const sendContactEmail = functions
       const resendApiKey = process.env.RESEND_API_KEY;
 
       if (!resendApiKey) {
-        console.error('RESEND_API_KEY secret not configured');
+        safeLog('sendContactEmail.error', 'RESEND_API_KEY secret not configured');
         res.status(500).json({
           success: false,
           error: 'Email service not configured'
@@ -115,11 +119,11 @@ Sent from gettruecost.com contact form
         text: textContent,
       });
 
-      console.log('Contact email sent successfully to all team members', { from: email, subject });
+      safeLog('sendContactEmail.log', 'Contact email sent successfully to all team members', { from: email, subject });
 
       res.status(200).json({ success: true, message: 'Email sent successfully' });
     } catch (error) {
-      console.error('Error sending contact email:', error);
+      safeLog('sendContactEmail.error', 'Error sending contact email:', error);
       res.status(500).json({
         success: false,
         error: 'Failed to send email. Please try again later.'

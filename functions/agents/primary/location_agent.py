@@ -10,6 +10,8 @@ This agent:
 4. Generates location cost factors and insights
 """
 
+from config.safe_logging import safe_error_text
+
 from typing import Dict, Any, Optional, List
 import asyncio
 import json
@@ -355,7 +357,7 @@ class LocationAgent(BaseA2AAgent):
         try:
             return await get_labor_rates_for_zip(zip_code)
         except Exception as e:
-            logger.warning("bls_api_error", zip_code=zip_code, error=str(e))
+            logger.warning("bls_api_error", zip_code=zip_code, error=safe_error_text(e))
             return None
 
     async def _search_location_data(
@@ -393,7 +395,7 @@ class LocationAgent(BaseA2AAgent):
                 "union": results[3] if not isinstance(results[3], Exception) else {},
             }
         except Exception as e:
-            logger.warning("search_location_data_error", error=str(e))
+            logger.warning("search_location_data_error", error=safe_error_text(e))
             return {}
 
     async def _extract_data_from_search(
@@ -427,7 +429,7 @@ class LocationAgent(BaseA2AAgent):
             return result.get("content", {})
 
         except Exception as e:
-            logger.warning("extract_search_data_error", error=str(e))
+            logger.warning("extract_search_data_error", error=safe_error_text(e))
             return {}
 
     def _build_search_summary(self, search_data: Dict[str, Any]) -> str:
@@ -893,7 +895,7 @@ class LocationAgent(BaseA2AAgent):
             logger.warning(
                 "llm_analysis_fallback",
                 estimate_id=estimate_id,
-                error=str(e)
+                error=safe_error_text(e)
             )
             return self._generate_fallback_analysis(location_factors)
 

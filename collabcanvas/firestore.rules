@@ -2,6 +2,14 @@ rules_version = '2';
 
 service cloud.firestore {
   match /databases/{database}/documents {
+    // Existing collaborators are exact {userId, role} entries written by shareProject.
+    function projectMember(data, editing) {
+      return request.auth != null && (data.ownerId == request.auth.uid
+        || (data.get('collaborators', []) is list
+          && (data.get('collaborators', []).hasAny([{'userId': request.auth.uid, 'role': 'editor'}])
+            || (!editing && data.get('collaborators', []).hasAny([{'userId': request.auth.uid, 'role': 'viewer'}])))));
+    }
+
     // Board document - allow authenticated users to create/read/update
     match /boards/{boardId} {
       allow read, write: if request.auth != null;
@@ -95,16 +103,9 @@ service cloud.firestore {
         return request.auth != null && resource.data.ownerId == request.auth.uid;
       }
       
-      // Read: Allow authenticated users to read project document for permission checking
-      // This is needed so that get() calls in subcollection rules can succeed
-      // Application logic enforces actual access control
-      allow read: if request.auth != null;
-      
-      // List: Allow authenticated users to query projects
-      // The query itself must filter by ownerId (where('ownerId', '==', userId))
-      // We can't check resource.data in list queries, so we allow the query and filter client-side
-      allow list: if request.auth != null;
-      
+      // Owners and actual collaborators may read; queries must prove membership.
+      allow read, list: if projectMember(resource.data, false);
+
       // Create: Authenticated user, must set ownerId to their uid
       allow create: if request.auth != null
         && request.resource.data.ownerId == request.auth.uid
@@ -116,13 +117,10 @@ service cloud.firestore {
         && request.resource.data.createdBy == request.auth.uid
         && request.resource.data.updatedBy == request.auth.uid;
       
-      // Update: Owner or editor collaborator
-      // Note: Firestore rules have limited array iteration capabilities
-      // We allow update if user is owner OR if document has collaborators array
-      // Application logic will enforce that user is actually an editor collaborator
-      // For stricter security in production, consider using a Cloud Function
+      // Editors may edit project content; only the owner may change collaborators.
       allow update: if request.auth != null
-        && (isOwner() || resource.data.collaborators != null)
+        && projectMember(resource.data, true)
+        && (isOwner() || request.resource.data.collaborators == resource.data.collaborators)
         && request.resource.data.ownerId == resource.data.ownerId // Cannot change owner
         && request.resource.data.createdBy == resource.data.createdBy // Cannot change creator
         && request.resource.data.createdAt == resource.data.createdAt; // Cannot change creation time
@@ -134,7 +132,7 @@ service cloud.firestore {
       match /shapes/{shapeId} {
         // Helper function to check if user is owner or collaborator
         function isOwnerOrCollaborator() {
-          return request.auth != null;
+          return projectMember(get(/databases/$(database)/documents/projects/$(projectId)).data, false);
         }
         
         // Read: Owner or collaborator (viewer/editor)
@@ -142,7 +140,7 @@ service cloud.firestore {
         
         // Create: Owner or editor collaborator
         // Temporarily allow any authenticated user to create shapes for debugging
-        allow create: if request.auth != null
+        allow create: if projectMember(get(/databases/$(database)/documents/projects/$(projectId)).data, true)
           // Validate shape type (checked in type-specific validation below)
           && request.resource.data.type is string
           // Validate position fields are numbers
@@ -175,7 +173,7 @@ service cloud.firestore {
         // Update: Owner or editor collaborator
         // Temporarily allow any authenticated user to update shapes for debugging
         // Note: For partial updates, request.resource.data contains merged data (existing + update)
-        allow update: if request.auth != null
+        allow update: if projectMember(get(/databases/$(database)/documents/projects/$(projectId)).data, true)
           // Validate that core fields don't change
           && resource.data.type is string
           && request.resource.data.createdBy == resource.data.createdBy
@@ -201,7 +199,7 @@ service cloud.firestore {
         
         // Delete: Owner or editor collaborator
         // Temporarily allow any authenticated user to delete shapes for debugging
-        allow delete: if request.auth != null;
+        allow delete: if projectMember(get(/databases/$(database)/documents/projects/$(projectId)).data, true);
       }
       
       // Layers subcollection - project-scoped layers
@@ -221,7 +219,7 @@ service cloud.firestore {
           return projectExists()
             && request.auth != null
             && (getProject().data.ownerId == request.auth.uid
-                || getProject().data.collaborators != null);
+                || projectMember(getProject().data, false));
         }
 
         // Helper function to check if user is owner or editor
@@ -229,7 +227,7 @@ service cloud.firestore {
           return projectExists()
             && request.auth != null
             && (getProject().data.ownerId == request.auth.uid
-                || getProject().data.collaborators != null);
+                || projectMember(getProject().data, true));
         }
 
         // Read: Owner or collaborator (viewer/editor)
@@ -237,7 +235,7 @@ service cloud.firestore {
 
         // Create: Owner or editor collaborator
         // Temporarily allow any authenticated user to create layers for debugging
-        allow create: if request.auth != null
+        allow create: if projectMember(get(/databases/$(database)/documents/projects/$(projectId)).data, true)
           && request.resource.data.name is string
           && request.resource.data.createdBy == request.auth.uid;
         
@@ -266,7 +264,7 @@ service cloud.firestore {
           return projectExists()
             && request.auth != null
             && (getProject().data.ownerId == request.auth.uid
-                || getProject().data.collaborators != null);
+                || projectMember(getProject().data, false));
         }
 
         // Helper function to check if user is owner or editor
@@ -274,7 +272,7 @@ service cloud.firestore {
           return projectExists()
             && request.auth != null
             && (getProject().data.ownerId == request.auth.uid
-                || getProject().data.collaborators != null);
+                || projectMember(getProject().data, true));
         }
 
         // Read: Owner or collaborator (viewer/editor)
@@ -307,7 +305,7 @@ service cloud.firestore {
           return projectExists()
             && request.auth != null
             && (getProject().data.ownerId == request.auth.uid
-                || getProject().data.collaborators != null);
+                || projectMember(getProject().data, false));
         }
 
         // Helper function to check if user is owner or editor
@@ -315,7 +313,7 @@ service cloud.firestore {
           return projectExists()
             && request.auth != null
             && (getProject().data.ownerId == request.auth.uid
-                || getProject().data.collaborators != null);
+                || projectMember(getProject().data, true));
         }
 
         // Read: Owner or collaborator (viewer/editor)
@@ -350,7 +348,7 @@ service cloud.firestore {
           return projectExists()
             && request.auth != null
             && (getProject().data.ownerId == request.auth.uid
-                || getProject().data.collaborators != null);
+                || projectMember(getProject().data, false));
         }
 
         // Helper function to check if user is owner or editor
@@ -358,7 +356,7 @@ service cloud.firestore {
           return projectExists()
             && request.auth != null
             && (getProject().data.ownerId == request.auth.uid
-                || getProject().data.collaborators != null);
+                || projectMember(getProject().data, true));
         }
 
         // Read: Owner or collaborator (viewer/editor)
@@ -402,7 +400,7 @@ service cloud.firestore {
           return projectExists()
             && request.auth != null
             && (getProject().data.ownerId == request.auth.uid
-                || getProject().data.collaborators != null);
+                || projectMember(getProject().data, false));
         }
 
         // Helper function to check if user is owner or editor
@@ -410,7 +408,7 @@ service cloud.firestore {
           return projectExists()
             && request.auth != null
             && (getProject().data.ownerId == request.auth.uid
-                || getProject().data.collaborators != null);
+                || projectMember(getProject().data, true));
         }
 
         // Read: Owner or collaborator (viewer/editor)
@@ -447,7 +445,7 @@ service cloud.firestore {
           return projectExists()
             && request.auth != null
             && (getProject().data.ownerId == request.auth.uid
-                || getProject().data.collaborators != null);
+                || projectMember(getProject().data, false));
         }
 
         // Helper function to check if user is owner or editor
@@ -455,7 +453,7 @@ service cloud.firestore {
           return projectExists()
             && request.auth != null
             && (getProject().data.ownerId == request.auth.uid
-                || getProject().data.collaborators != null);
+                || projectMember(getProject().data, true));
         }
 
         // Read/List: Owner or collaborator (viewer/editor)
@@ -500,7 +498,7 @@ service cloud.firestore {
           return request.auth != null
             && projectExists()
             && (getProject().data.ownerId == request.auth.uid
-                || getProject().data.collaborators != null);
+                || projectMember(getProject().data, false));
         }
 
         // Read: Allow owner or collaborator to read price comparison results
@@ -508,7 +506,7 @@ service cloud.firestore {
 
         // Create/Update: Cloud Functions use Admin SDK (bypasses rules)
         // Allow owner or collaborator for testing/development
-        allow create, update: if isOwnerOrCollaborator();
+        allow create, update: if projectMember(get(/databases/$(database)/documents/projects/$(projectId)).data, true);
 
         // Delete: Only owner
         allow delete: if projectExists()
@@ -533,14 +531,14 @@ service cloud.firestore {
           return projectExists()
             && request.auth != null
             && (getProject().data.ownerId == request.auth.uid
-                || getProject().data.collaborators != null);
+                || projectMember(getProject().data, false));
         }
 
         // Read: Owner or collaborator
         allow read: if isOwnerOrCollaborator();
 
         // Create/Update: Owner or collaborator
-        allow create, update: if isOwnerOrCollaborator()
+        allow create, update: if projectMember(get(/databases/$(database)/documents/projects/$(projectId)).data, true)
           && request.resource.data.updatedBy == request.auth.uid;
 
         // Delete: Only owner
@@ -589,7 +587,7 @@ service cloud.firestore {
           return request.auth != null
             && projectExists()
             && (getProject().data.ownerId == request.auth.uid
-                || getProject().data.collaborators != null);
+                || projectMember(getProject().data, false));
         }
 
         // Read: Allow owner or collaborator to read pipeline status
@@ -598,7 +596,7 @@ service cloud.firestore {
 
         // Create/Update: Cloud Functions use Admin SDK (bypasses rules)
         // Allow owner or collaborator for triggering pipelines
-        allow create, update: if isOwnerOrCollaborator();
+        allow create, update: if projectMember(get(/databases/$(database)/documents/projects/$(projectId)).data, true);
 
         // Delete: Only owner
         allow delete: if projectExists()
@@ -624,51 +622,21 @@ service cloud.firestore {
       // - For subcollection rules, `resource` is the child doc (no userId), so we must read parent.
       // IMPORTANT: do NOT rely on request.resource for reads (it is not populated for reads).
       function isEstimateOwner() {
-        return isSignedIn() && (
-          // Estimate document itself
-          (resource != null && resource.data.userId == request.auth.uid)
-          // Subcollections (derive from parent estimate)
-          || (getEstimate() != null && getEstimate().data.userId == request.auth.uid)
-        );
+        return isSignedIn() && getEstimate().data.userId == request.auth.uid;
       }
 
-      // Helper: allow writes while pipeline is mutable
-      function pipelineWritable() {
-        let est = getEstimate();
-        return est != null
-          && est.data.status in ['draft', 'clarifying', 'processing', 'plan_review'];
-      }
-
-      // Estimate document rules
+      // Pipeline documents and derived money are server-owned. Admin SDK bypasses
+      // these client rules; application endpoints enforce verified ownership.
       allow read: if isEstimateOwner();
+      allow create, update, delete: if false;
 
-      allow create: if isSignedIn()
-        && request.resource.data.userId == request.auth.uid
-        && request.resource.data.createdAt is timestamp
-        && request.resource.data.updatedAt is timestamp
-        && request.resource.data.status is string;
-
-      allow update: if isEstimateOwner()
-        // owner cannot change
-        && request.resource.data.userId == resource.data.userId
-        // preserve creation time
-        && request.resource.data.createdAt == resource.data.createdAt
-        // updatedAt must be timestamp
-        && request.resource.data.updatedAt is timestamp;
-
-      allow delete: if isEstimateOwner();
-
-      // Agent outputs (per agent) - read-only after pipeline completion
       match /agentOutputs/{agentId} {
         allow read: if isEstimateOwner();
-        allow create, update: if isEstimateOwner() && pipelineWritable();
-        allow delete: if isEstimateOwner() && pipelineWritable();
+        allow write: if false;
       }
-      
-      // Granular cost ledger items
       match /costItems/{costItemId} {
         allow read: if isEstimateOwner();
-        allow create, update, delete: if isEstimateOwner() && pipelineWritable();
+        allow write: if false;
       }
 
       // Conversations tied to an estimate
@@ -750,6 +718,12 @@ service cloud.firestore {
       // create uses request.resource (incoming data), post-creation rules use resource (existing doc)
       allow create: if request.auth != null && request.auth.uid == request.resource.data.userId;
       allow read, update, delete: if request.auth != null && request.auth.uid == resource.data.userId;
+    }
+
+    // Durable execution is server-owned, including leases, embedded intents and
+    // authoritative checkpoints. Clients observe the existing estimate views.
+    match /durableJobs/{jobId}/{document=**} {
+      allow read, write: if false;
     }
 
     // Deny all other paths

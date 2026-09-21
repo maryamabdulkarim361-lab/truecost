@@ -1,10 +1,7 @@
 "use strict";
-/**
- * Enhanced LLM Inference Module
- * Improved prompts and structured output for better JSON accuracy
- */
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.mergeInferenceIntoCSI = exports.runEnhancedInference = void 0;
+const safeDiagnostics_1 = require("./safeDiagnostics");
 // ===================
 // ENHANCED PROMPTS
 // ===================
@@ -202,7 +199,7 @@ async function runEnhancedInference(openai, quantities, projectType, finishLevel
         return validateAndFixInferenceResult(parsed);
     }
     catch (error) {
-        console.error('[ENHANCED_INFERENCE] Error:', error);
+        (0, safeDiagnostics_1.safeLog)('enhancedInference.error', '[ENHANCED_INFERENCE] Error:', error);
         return getDefaultInferenceResult();
     }
 }

@@ -385,3 +385,39 @@ class TestGetAllTrades:
         assert len(trades) == 8
         assert "electrician" in trades
         assert "general_labor" in trades
+
+
+@pytest.fixture(autouse=True)
+def offline_http_failure(monkeypatch):
+    """Keep service tests offline while exercising actual retry/fallback handling."""
+    import httpx
+    from tenacity import wait_none
+    from services import bls_service as service
+
+    client = AsyncMock()
+    client.post.side_effect = httpx.ConnectError("synthetic offline failure")
+    context = MagicMock()
+    context.__aenter__ = AsyncMock(return_value=client)
+    context.__aexit__ = AsyncMock(return_value=False)
+    monkeypatch.setattr(service.httpx, "AsyncClient", MagicMock(return_value=context))
+    monkeypatch.setattr(service._fetch_bls_data.retry, "wait", wait_none())
+    return client.post
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_kind", ["connection", "timeout", "http_status"])
+async def test_exhausted_http_retries_use_fallback(offline_http_failure, failure_kind):
+    import httpx
+
+    errors = {
+        "connection": httpx.ConnectError("synthetic connection failure"),
+        "timeout": httpx.ReadTimeout("synthetic timeout"),
+        "http_status": httpx.HTTPStatusError(
+            "synthetic unavailable", request=httpx.Request("GET", "https://offline.invalid"),
+            response=httpx.Response(503),
+        ),
+    }
+    offline_http_failure.side_effect = errors[failure_kind]
+    result = await get_labor_rates_for_zip("10001")
+    assert result.cached is True
+    assert offline_http_failure.await_count == 3

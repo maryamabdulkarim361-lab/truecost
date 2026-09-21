@@ -249,12 +249,15 @@ class TestLocationAgent:
         service.get_location_factors = AsyncMock(return_value=DENVER_LOCATION_FACTORS)
         return service
     
+    @pytest.mark.parametrize("col_index, expected_factor", [(None, 1.0), (112.5, 1.05)])
     @pytest.mark.asyncio
     async def test_run_denver_location(
         self,
         mock_firestore,
         mock_llm,
-        mock_cost_service
+        mock_cost_service,
+        col_index,
+        expected_factor,
     ):
         """Test running location agent for Denver."""
         agent = LocationAgent(
@@ -263,6 +266,12 @@ class TestLocationAgent:
             cost_data_service=mock_cost_service
         )
         
+        # Mock the current evidence boundaries, not the unused cost-service lookup.
+        agent._fetch_bls_labor_rates = AsyncMock(return_value=None)
+        agent._search_location_data = AsyncMock(return_value={})
+        agent._extract_data_from_search = AsyncMock(return_value=(
+            {} if col_index is None else {"costOfLivingIndex": col_index}
+        ))
         input_data = get_denver_clarification_input()
         result = await agent.run(
             estimate_id="est-test-001",
@@ -273,7 +282,7 @@ class TestLocationAgent:
         assert result["zipCode"] == "80202"
         assert result["city"] == "Denver"
         assert result["state"] == "CO"
-        assert result["locationFactor"] == 1.05
+        assert result["locationFactor"] == expected_factor
         assert "laborRates" in result
         assert "permitCosts" in result
         assert "analysis" in result

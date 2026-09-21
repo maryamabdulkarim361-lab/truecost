@@ -1,4 +1,7 @@
 "use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.deleteProjectSubcollections = void 0;
+const safeDiagnostics_1 = require("./safeDiagnostics");
 /**
  * Cloud Function to delete project and all subcollections
  * This function recursively deletes all subcollections when a project is deleted
@@ -9,8 +12,6 @@
  * 2. Proper error handling and logging
  * 3. Testing with Firebase emulator
  */
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.deleteProjectSubcollections = void 0;
 // TODO: Uncomment and configure when ready to deploy
 // import { onDocumentDeleted } from 'firebase-functions/v2/firestore';
 // import { getFirestore } from 'firebase-admin/firestore';
@@ -34,8 +35,8 @@ async function deleteProjectSubcollections(projectId) {
     // 3. List all subcollections
     // 4. Recursively delete all documents in subcollections
     // 5. Handle errors gracefully
-    console.log(`[TODO] Delete subcollections for project ${projectId}`);
-    console.log('[TODO] This requires Cloud Function deployment with Firebase Admin SDK');
+    (0, safeDiagnostics_1.safeLog)('projectDeletion.log', `[TODO] Delete subcollections for project ${projectId}`);
+    (0, safeDiagnostics_1.safeLog)('projectDeletion.log', '[TODO] This requires Cloud Function deployment with Firebase Admin SDK');
     // Placeholder implementation
     // In production, this would be:
     // const projectRef = db.collection('projects').doc(projectId);

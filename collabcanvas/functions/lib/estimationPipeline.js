@@ -1,4 +1,7 @@
 "use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.estimationPipeline = exports.assembleClarificationOutput = exports.createCSIScope = void 0;
+const safeDiagnostics_1 = require("./safeDiagnostics");
 /**
  * Estimation Pipeline Cloud Function
  * PRIMARY: Uses user annotations (polylines, polygons, bounding boxes) with scale for accurate measurements
@@ -10,9 +13,8 @@
  * - Schema validation before output
  * - Enhanced LLM prompts for better accuracy
  */
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.estimationPipeline = void 0;
 const https_1 = require("firebase-functions/v2/https");
+const functionSecurity_1 = require("./functionSecurity");
 const openai_1 = require("openai");
 const admin = require("firebase-admin");
 const firestore_1 = require("firebase-admin/firestore");
@@ -27,7 +29,7 @@ function getOpenAI() {
     if (!_openai) {
         const apiKey = process.env.OPENAI_API_KEY;
         if (!apiKey) {
-            console.error('[ESTIMATION_PIPELINE] OPENAI_API_KEY not configured');
+            (0, safeDiagnostics_1.safeLog)('estimationPipeline.error', '[ESTIMATION_PIPELINE] OPENAI_API_KEY not configured');
             throw new Error('OPENAI_API_KEY not configured');
         }
         _openai = new openai_1.OpenAI({ apiKey });
@@ -89,6 +91,7 @@ function createCSIScope(computedItems) {
     }
     return scope;
 }
+exports.createCSIScope = createCSIScope;
 // ===================
 // IMAGE HELPERS
 // ===================
@@ -151,16 +154,16 @@ async function imageUrlToBase64(imageUrl) {
     // SSRF protection: block local/private URLs in production
     if (isLocalUrl(imageUrl)) {
         if (process.env.FUNCTIONS_EMULATOR !== 'true') {
-            console.error('[SSRF] Blocked attempt to fetch local/private URL in production');
+            (0, safeDiagnostics_1.safeLog)('estimationPipeline.error', '[SSRF] Blocked attempt to fetch local/private URL in production');
             throw new Error('Cannot fetch images from local or private addresses');
         }
         // In emulator mode, allow local URLs for development
-        console.log('[DEV] Allowing local URL fetch in emulator mode');
+        (0, safeDiagnostics_1.safeLog)('estimationPipeline.log', '[DEV] Allowing local URL fetch in emulator mode');
     }
     try {
         const response = await fetch(imageUrl);
         if (!response.ok) {
-            console.error(`[IMAGE] Fetch failed with status ${response.status}`);
+            (0, safeDiagnostics_1.safeLog)('estimationPipeline.error', `[IMAGE] Fetch failed with status ${response.status}`);
             throw new Error('Failed to fetch image');
         }
         // Derive MIME type from Content-Type header
@@ -172,12 +175,12 @@ async function imageUrlToBase64(imageUrl) {
                 mimeType = parsedType;
             }
             else {
-                console.error(`[IMAGE] Invalid Content-Type received: ${parsedType}`);
+                (0, safeDiagnostics_1.safeLog)('estimationPipeline.error', `[IMAGE] Invalid Content-Type received: ${parsedType}`);
                 throw new Error('Response is not an image');
             }
         }
         else {
-            console.warn('[IMAGE] No Content-Type header, defaulting to image/jpeg');
+            (0, safeDiagnostics_1.safeLog)('estimationPipeline.warn', '[IMAGE] No Content-Type header, defaulting to image/jpeg');
         }
         const arrayBuffer = await response.arrayBuffer();
         const buffer = Buffer.from(arrayBuffer);
@@ -186,7 +189,7 @@ async function imageUrlToBase64(imageUrl) {
     }
     catch (error) {
         // Log error internally but re-throw with minimal detail
-        console.error('[IMAGE] Error processing image:', error instanceof Error ? error.message : 'Unknown error');
+        (0, safeDiagnostics_1.safeLog)('estimationPipeline.error', '[IMAGE] Error processing image:', error instanceof Error ? error.message : 'Unknown error');
         throw new Error('Failed to process image');
     }
 }
@@ -236,13 +239,203 @@ async function prepareImageForInference(planImageUrl) {
 // ===================
 // CLOUD FUNCTION
 // ===================
-exports.estimationPipeline = (0, https_1.onCall)({
-    cors: true,
+function assembleClarificationOutput(args) {
+    var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k, _l, _m, _o, _p, _q, _r, _s, _t, _u, _v;
+    const { estimateId, csiScope, quantities, clarificationData, scopeText, planImageUrl, spaceModel, projectSpecificData, spatialNarrative, inferenceResult } = args;
+    // Count divisions by status
+    const divisionCounts = { included: 0, excluded: 0, byOwner: 0, notApplicable: 0 };
+    const includedDivisions = [];
+    const excludedDivisions = [];
+    const notApplicableDivisions = [];
+    for (const [, div] of Object.entries(csiScope)) {
+        const divObj = div;
+        switch (divObj.status) {
+            case 'included':
+                divisionCounts.included++;
+                includedDivisions.push(divObj.code);
+                break;
+            case 'excluded':
+                divisionCounts.excluded++;
+                excludedDivisions.push(divObj.code);
+                break;
+            case 'not_applicable':
+                divisionCounts.notApplicable++;
+                notApplicableDivisions.push(divObj.code);
+                break;
+        }
+    }
+    const projectBrief = {
+        projectType: clarificationData.projectType || 'other',
+        location: clarificationData.location || {
+            fullAddress: '',
+            streetAddress: '',
+            city: '',
+            state: '',
+            zipCode: '',
+        },
+        scopeSummary: {
+            description: scopeText,
+            totalSqft: (_a = quantities.totalFloorArea) !== null && _a !== void 0 ? _a : 0,
+            rooms: ((_b = quantities.rooms) !== null && _b !== void 0 ? _b : []).map(r => { var _a; return (_a = r === null || r === void 0 ? void 0 : r.name) !== null && _a !== void 0 ? _a : ''; }),
+            finishLevel: clarificationData.finishLevel || 'mid_range',
+            projectComplexity: ((_c = quantities.totalRoomCount) !== null && _c !== void 0 ? _c : 0) > 3 ? 'complex' : ((_d = quantities.totalRoomCount) !== null && _d !== void 0 ? _d : 0) > 1 ? 'moderate' : 'simple',
+            includedDivisions,
+            excludedDivisions,
+            byOwnerDivisions: [],
+            notApplicableDivisions,
+            totalIncluded: divisionCounts.included,
+            totalExcluded: divisionCounts.excluded,
+        },
+        specialRequirements: clarificationData.specialRequirements || [],
+        exclusions: clarificationData.exclusions || [],
+        timeline: {
+            flexibility: clarificationData.flexibility || 'flexible',
+        },
+    };
+    if (clarificationData.desiredStart) {
+        projectBrief.timeline.desiredStart = clarificationData.desiredStart;
+    }
+    if (clarificationData.deadline) {
+        projectBrief.timeline.deadline = clarificationData.deadline;
+    }
+    // Build CAD data - using schema-valid enum values
+    // Schema requires: fileType: "dwg" | "dxf" | "pdf" | "png" | "jpg"
+    // Schema requires: extractionMethod: "ezdxf" | "vision"
+    const getFileType = (url) => {
+        if (!url)
+            return 'png'; // Default to png
+        const lowerUrl = url.toLowerCase();
+        if (lowerUrl.includes('.dwg'))
+            return 'dwg';
+        if (lowerUrl.includes('.dxf'))
+            return 'dxf';
+        if (lowerUrl.includes('.pdf'))
+            return 'pdf';
+        if (lowerUrl.includes('.jpg') || lowerUrl.includes('.jpeg'))
+            return 'jpg';
+        return 'png'; // Default to png
+    };
+    const cadData = {
+        fileUrl: planImageUrl || 'placeholder://no-image-uploaded',
+        fileType: getFileType(planImageUrl),
+        extractionMethod: 'vision',
+        extractionConfidence: quantities.hasScale ? 0.95 : 0.6,
+        spaceModel,
+        spatialRelationships: {
+            layoutNarrative: spatialNarrative,
+            roomAdjacencies: [],
+            entryPoints: [],
+        },
+    };
+    // Add project-specific data based on project type
+    if (projectSpecificData.kitchenSpecific) {
+        cadData.kitchenSpecific = projectSpecificData.kitchenSpecific;
+    }
+    if (projectSpecificData.bathroomSpecific) {
+        cadData.bathroomSpecific = projectSpecificData.bathroomSpecific;
+    }
+    if (projectSpecificData.bedroomSpecific) {
+        cadData.bedroomSpecific = projectSpecificData.bedroomSpecific;
+    }
+    if (projectSpecificData.livingAreaSpecific) {
+        cadData.livingAreaSpecific = projectSpecificData.livingAreaSpecific;
+    }
+    // Build flags with enhanced data (defensive: copy warnings array to allow mutation)
+    const flags = {
+        lowConfidenceItems: [],
+        missingData: [...((_e = quantities.warnings) !== null && _e !== void 0 ? _e : [])],
+        userVerificationRequired: !((_f = quantities.hasScale) !== null && _f !== void 0 ? _f : false),
+        verificationItems: [],
+    };
+    if (!quantities.hasScale) {
+        flags.lowConfidenceItems.push({
+            field: 'scale',
+            confidence: 0.0,
+            reason: 'No scale set - all measurements are in pixels',
+        });
+    }
+    // Add scope ambiguities from LLM inference as verification items
+    if (inferenceResult === null || inferenceResult === void 0 ? void 0 : inferenceResult.scopeAmbiguities) {
+        for (const ambiguity of inferenceResult.scopeAmbiguities) {
+            if (ambiguity === null || ambiguity === void 0 ? void 0 : ambiguity.clarificationNeeded) {
+                flags.verificationItems.push(ambiguity.clarificationNeeded);
+            }
+            if (ambiguity === null || ambiguity === void 0 ? void 0 : ambiguity.issue) {
+                flags.missingData.push(ambiguity.issue);
+            }
+        }
+    }
+    const clarificationOutput = {
+        estimateId,
+        schemaVersion: '3.0.0',
+        timestamp: new Date().toISOString(),
+        clarificationStatus: quantities.hasScale ? 'complete' : 'needs_review',
+        projectBrief,
+        csiScope,
+        cadData,
+        conversation: {
+            inputMethod: 'mixed',
+            messageCount: 0,
+            clarificationQuestions: [],
+            confidenceScore: quantities.hasScale ? 0.95 : 0.5,
+        },
+        flags,
+        // Include computed quantities summary for transparency (with safe defaults)
+        computedQuantities: {
+            source: 'user_annotations',
+            hasScale: (_g = quantities.hasScale) !== null && _g !== void 0 ? _g : false,
+            scaleUnit: (_h = quantities.scaleUnit) !== null && _h !== void 0 ? _h : 'pixels',
+            totalWallLength: (_j = quantities.totalWallLength) !== null && _j !== void 0 ? _j : 0,
+            totalFloorArea: (_k = quantities.totalFloorArea) !== null && _k !== void 0 ? _k : 0,
+            totalRoomCount: (_l = quantities.totalRoomCount) !== null && _l !== void 0 ? _l : 0,
+            totalDoorCount: (_m = quantities.totalDoorCount) !== null && _m !== void 0 ? _m : 0,
+            totalWindowCount: (_o = quantities.totalWindowCount) !== null && _o !== void 0 ? _o : 0,
+            layerSummary: (_p = quantities.layerSummary) !== null && _p !== void 0 ? _p : {},
+        },
+        // Include inference metadata for transparency (with safe defaults for nested fields)
+        inferenceMetadata: inferenceResult ? {
+            roomTypesInferred: ((_q = inferenceResult.roomTypes) !== null && _q !== void 0 ? _q : []).length,
+            itemsInferred: ((_r = inferenceResult.inferredItems) !== null && _r !== void 0 ? _r : []).length,
+            allowancesAdded: ((_s = inferenceResult.standardAllowances) !== null && _s !== void 0 ? _s : []).length,
+            ambiguitiesFound: ((_t = inferenceResult.scopeAmbiguities) !== null && _t !== void 0 ? _t : []).length,
+            materialsRecommended: ((_v = (_u = inferenceResult.materialsAndFinishes) === null || _u === void 0 ? void 0 : _u.recommended) !== null && _v !== void 0 ? _v : []).length,
+        } : null,
+    };
+    // ===================
+    // STEP 8: VALIDATE AND AUTO-FIX OUTPUT
+    // ===================
+    (0, safeDiagnostics_1.safeLog)('estimationPipeline.log', '[ESTIMATION] Validating ClarificationOutput...');
+    // First validate
+    const validationResult = (0, schemaValidator_1.validateClarificationOutput)(clarificationOutput);
+    (0, safeDiagnostics_1.safeLog)('estimationPipeline.log', `[ESTIMATION] Validation: ${validationResult.isValid ? 'PASSED' : 'NEEDS FIXES'}, Score: ${validationResult.completenessScore}/100`);
+    if (validationResult.errors.length > 0) {
+        (0, safeDiagnostics_1.safeLog)('estimationPipeline.log', `[ESTIMATION] Found ${validationResult.errors.length} errors, ${validationResult.warnings.length} warnings`);
+        (0, safeDiagnostics_1.safeLog)('estimationPipeline.log', (0, schemaValidator_1.getValidationSummary)(validationResult));
+    }
+    // Auto-fix common issues
+    const fixedOutput = (0, schemaValidator_1.autoFixClarificationOutput)(clarificationOutput);
+    // Re-validate after fix
+    const finalValidation = (0, schemaValidator_1.validateClarificationOutput)(fixedOutput);
+    (0, safeDiagnostics_1.safeLog)('estimationPipeline.log', `[ESTIMATION] After auto-fix: ${finalValidation.isValid ? 'PASSED' : 'STILL HAS ISSUES'}, Score: ${finalValidation.completenessScore}/100`);
+    // Never advertise incomplete/invalid producer data as ready for strict start.
+    // Preserve the supplied values for review; do not repair construction facts.
+    const blockingWarnings = new Set(['INCOMPLETE_LOCATION', 'INVALID_PROJECT_TYPE', 'INVALID_FINISH_LEVEL', 'INVALID_COMPLEXITY', 'INVALID_SQFT']);
+    const requiresReview = !finalValidation.isValid || finalValidation.warnings.some(w => blockingWarnings.has(w.code)) ||
+        !planImageUrl || fixedOutput.flags.userVerificationRequired;
+    if (requiresReview) {
+        fixedOutput.clarificationStatus = 'needs_review';
+        fixedOutput.flags.userVerificationRequired = true;
+    }
+    return { fixedOutput, finalValidation };
+}
+exports.assembleClarificationOutput = assembleClarificationOutput;
+exports.estimationPipeline = (0, functionSecurity_1.onCall)({
+    cors: (0, functionSecurity_1.allowedOrigins)(),
     secrets: ['OPENAI_API_KEY'],
     timeoutSeconds: 300,
     memory: '1GiB',
 }, async (request) => {
-    var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k, _l, _m, _o, _p, _q, _r, _s, _t, _u, _v, _w, _x, _y, _z;
+    var _a, _b, _c, _d;
     try {
         const data = request.data;
         const { projectId, sessionId, planImageUrl, scopeText, clarificationData, annotationSnapshot, clarificationContext: providedContext, passNumber = 1, } = data;
@@ -275,12 +468,12 @@ exports.estimationPipeline = (0, https_1.onCall)({
         if ((projectData === null || projectData === void 0 ? void 0 : projectData.ownerId) !== userId) {
             // Check if user is a collaborator
             const collaborators = (projectData === null || projectData === void 0 ? void 0 : projectData.collaborators) || [];
-            const isCollaborator = collaborators.some((c) => c.id === userId);
+            const isCollaborator = collaborators.some((c) => c.userId === userId && c.role === 'editor');
             if (!isCollaborator) {
                 throw new https_1.HttpsError('permission-denied', 'User does not have access to this project');
             }
         }
-        console.log(`[ESTIMATION] Starting pass ${passNumber} for session ${sessionId}`);
+        (0, safeDiagnostics_1.safeLog)('estimationPipeline.log', `[ESTIMATION] Starting pass ${passNumber} for session ${sessionId}`);
         // ===================
         // LOAD CLARIFICATION CONTEXT FROM FIRESTORE (if not provided)
         // ===================
@@ -299,14 +492,14 @@ exports.estimationPipeline = (0, https_1.onCall)({
                 if (contextDoc.exists) {
                     const contextData = contextDoc.data();
                     clarificationContext = (contextData === null || contextData === void 0 ? void 0 : contextData.clarifications) || {};
-                    console.log('[ESTIMATION] Loaded clarification context from Firestore:', clarificationContext);
+                    (0, safeDiagnostics_1.safeLog)('estimationPipeline.log', '[ESTIMATION] Loaded clarification context from Firestore:', clarificationContext);
                 }
             }
             catch (err) {
-                console.warn('[ESTIMATION] Could not load clarification context:', err);
+                (0, safeDiagnostics_1.safeLog)('estimationPipeline.warn', '[ESTIMATION] Could not load clarification context:', err);
             }
         }
-        console.log('[ESTIMATION] Using clarification context:', {
+        (0, safeDiagnostics_1.safeLog)('estimationPipeline.log', '[ESTIMATION] Using clarification context:', {
             hasExclusions: Object.keys(clarificationContext.exclusions || {}).length > 0,
             hasInclusions: Object.keys(clarificationContext.inclusions || {}).length > 0,
             hasAreaRelationships: Object.keys(clarificationContext.areaRelationships || {}).length > 0,
@@ -315,7 +508,7 @@ exports.estimationPipeline = (0, https_1.onCall)({
         // ===================
         // STEP 1: COMPUTE QUANTITIES FROM ANNOTATIONS (PRIMARY)
         // ===================
-        console.log('[ESTIMATION] Computing quantities from user annotations...');
+        (0, safeDiagnostics_1.safeLog)('estimationPipeline.log', '[ESTIMATION] Computing quantities from user annotations...');
         // Defensive null-safety: guard against annotationSnapshot being undefined/null
         const safeAnnotationSnapshot = annotationSnapshot !== null && annotationSnapshot !== void 0 ? annotationSnapshot : { shapes: [], layers: [] };
         // Ensure layers have required fields
@@ -334,7 +527,7 @@ exports.estimationPipeline = (0, https_1.onCall)({
             capturedAt: safeAnnotationSnapshot.capturedAt || Date.now(),
         };
         const quantities = (0, annotationQuantifier_1.computeQuantitiesFromAnnotations)(normalizedSnapshot);
-        console.log('[ESTIMATION] Computed from annotations:', {
+        (0, safeDiagnostics_1.safeLog)('estimationPipeline.log', '[ESTIMATION] Computed from annotations:', {
             hasScale: quantities.hasScale,
             scaleUnit: quantities.scaleUnit,
             totalWallLength: quantities.totalWallLength,
@@ -346,7 +539,7 @@ exports.estimationPipeline = (0, https_1.onCall)({
         // ===================
         // STEP 2: BUILD SPACE MODEL FROM ANNOTATIONS
         // ===================
-        console.log('[ESTIMATION] Building space model from computed quantities...');
+        (0, safeDiagnostics_1.safeLog)('estimationPipeline.log', '[ESTIMATION] Building space model from computed quantities...');
         const spaceModel = (0, annotationQuantifier_1.buildSpaceModelFromQuantities)(quantities);
         // ===================
         // STEP 3: DETERMINE PROJECT CONTEXT
@@ -354,20 +547,20 @@ exports.estimationPipeline = (0, https_1.onCall)({
         const projectType = clarificationData.projectType ||
             inferProjectType(scopeText) || 'other';
         const finishLevel = clarificationData.finishLevel || 'mid_range';
-        console.log(`[ESTIMATION] Project type: ${projectType}, Finish level: ${finishLevel}`);
+        (0, safeDiagnostics_1.safeLog)('estimationPipeline.log', `[ESTIMATION] Project type: ${projectType}, Finish level: ${finishLevel}`);
         // ===================
         // STEP 4: BUILD ENHANCED CSI ITEMS FROM ANNOTATIONS
         // ===================
-        console.log('[ESTIMATION] Building enhanced CSI items from computed quantities...');
+        (0, safeDiagnostics_1.safeLog)('estimationPipeline.log', '[ESTIMATION] Building enhanced CSI items from computed quantities...');
         // Apply confirmed quantities from clarification context
         if (clarificationContext.confirmedQuantities) {
             if (clarificationContext.confirmedQuantities.doors !== undefined) {
-                console.log(`[ESTIMATION] Using confirmed door count: ${clarificationContext.confirmedQuantities.doors}`);
+                (0, safeDiagnostics_1.safeLog)('estimationPipeline.log', `[ESTIMATION] Using confirmed door count: ${clarificationContext.confirmedQuantities.doors}`);
                 // Override door count if user confirmed a specific number
                 quantities.totalDoorCount = clarificationContext.confirmedQuantities.doors;
             }
             if (clarificationContext.confirmedQuantities.windows !== undefined) {
-                console.log(`[ESTIMATION] Using confirmed window count: ${clarificationContext.confirmedQuantities.windows}`);
+                (0, safeDiagnostics_1.safeLog)('estimationPipeline.log', `[ESTIMATION] Using confirmed window count: ${clarificationContext.confirmedQuantities.windows}`);
                 quantities.totalWindowCount = clarificationContext.confirmedQuantities.windows;
             }
         }
@@ -382,7 +575,7 @@ exports.estimationPipeline = (0, https_1.onCall)({
         // ===================
         // STEP 5: EXTRACT PROJECT-SPECIFIC DATA
         // ===================
-        console.log('[ESTIMATION] Extracting project-specific data...');
+        (0, safeDiagnostics_1.safeLog)('estimationPipeline.log', '[ESTIMATION] Extracting project-specific data...');
         const projectSpecificData = (0, projectSpecificExtractor_1.extractProjectSpecificData)(quantities, projectType, clarificationData, scopeText);
         // ===================
         // STEP 6: LLM INFERENCE FOR GAP-FILLING (SECONDARY)
@@ -392,7 +585,7 @@ exports.estimationPipeline = (0, https_1.onCall)({
         // Only use LLM if we have annotations but need inference for non-measured items
         if (quantities.hasScale && (quantities.totalWallLength > 0 || quantities.totalFloorArea > 0)) {
             if (process.env.OPENAI_API_KEY) {
-                console.log('[ESTIMATION] Running enhanced LLM inference for gap-filling...');
+                (0, safeDiagnostics_1.safeLog)('estimationPipeline.log', '[ESTIMATION] Running enhanced LLM inference for gap-filling...');
                 const openai = getOpenAI();
                 // Prepare image URL if available (handles local URL conversion and SSRF protection)
                 const imageUrl = planImageUrl ? await prepareImageForInference(planImageUrl) : planImageUrl;
@@ -406,20 +599,20 @@ exports.estimationPipeline = (0, https_1.onCall)({
                 const inferredItemsCount = ((_b = inferenceResult === null || inferenceResult === void 0 ? void 0 : inferenceResult.inferredItems) !== null && _b !== void 0 ? _b : []).length;
                 const allowancesCount = ((_c = inferenceResult === null || inferenceResult === void 0 ? void 0 : inferenceResult.standardAllowances) !== null && _c !== void 0 ? _c : []).length;
                 const ambiguitiesCount = ((_d = inferenceResult === null || inferenceResult === void 0 ? void 0 : inferenceResult.scopeAmbiguities) !== null && _d !== void 0 ? _d : []).length;
-                console.log(`[ESTIMATION] LLM inference added ${inferredItemsCount} items, ${allowancesCount} allowances`);
+                (0, safeDiagnostics_1.safeLog)('estimationPipeline.log', `[ESTIMATION] LLM inference added ${inferredItemsCount} items, ${allowancesCount} allowances`);
                 if (ambiguitiesCount > 0) {
-                    console.log(`[ESTIMATION] Found ${ambiguitiesCount} scope ambiguities for review`);
+                    (0, safeDiagnostics_1.safeLog)('estimationPipeline.log', `[ESTIMATION] Found ${ambiguitiesCount} scope ambiguities for review`);
                 }
             }
             else {
-                console.log('[ESTIMATION] No API key - using annotation data only');
+                (0, safeDiagnostics_1.safeLog)('estimationPipeline.log', '[ESTIMATION] No API key - using annotation data only');
             }
         }
         else if (!quantities.hasScale) {
-            console.log('[ESTIMATION] No scale set - using annotation data only');
+            (0, safeDiagnostics_1.safeLog)('estimationPipeline.log', '[ESTIMATION] No scale set - using annotation data only');
         }
         else {
-            console.log('[ESTIMATION] No annotations - using defaults only');
+            (0, safeDiagnostics_1.safeLog)('estimationPipeline.log', '[ESTIMATION] No annotations - using defaults only');
         }
         // Generate layout narrative from extracted data if LLM didn't provide one
         if (!spatialNarrative || spatialNarrative.length < 200) {
@@ -431,188 +624,15 @@ exports.estimationPipeline = (0, https_1.onCall)({
         // STEP 6: ASSEMBLE CLARIFICATION OUTPUT
         // ===================
         const estimateId = `est_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-        // Count divisions by status
-        const divisionCounts = { included: 0, excluded: 0, byOwner: 0, notApplicable: 0 };
-        const includedDivisions = [];
-        const excludedDivisions = [];
-        const notApplicableDivisions = [];
-        for (const [, div] of Object.entries(csiScope)) {
-            const divObj = div;
-            switch (divObj.status) {
-                case 'included':
-                    divisionCounts.included++;
-                    includedDivisions.push(divObj.code);
-                    break;
-                case 'excluded':
-                    divisionCounts.excluded++;
-                    excludedDivisions.push(divObj.code);
-                    break;
-                case 'not_applicable':
-                    divisionCounts.notApplicable++;
-                    notApplicableDivisions.push(divObj.code);
-                    break;
-            }
-        }
-        const projectBrief = {
-            projectType: clarificationData.projectType || 'other',
-            location: clarificationData.location || {
-                fullAddress: '',
-                streetAddress: '',
-                city: '',
-                state: '',
-                zipCode: '',
-            },
-            scopeSummary: {
-                description: scopeText,
-                totalSqft: (_e = quantities.totalFloorArea) !== null && _e !== void 0 ? _e : 0,
-                rooms: ((_f = quantities.rooms) !== null && _f !== void 0 ? _f : []).map(r => { var _a; return (_a = r === null || r === void 0 ? void 0 : r.name) !== null && _a !== void 0 ? _a : ''; }),
-                finishLevel: clarificationData.finishLevel || 'mid_range',
-                projectComplexity: ((_g = quantities.totalRoomCount) !== null && _g !== void 0 ? _g : 0) > 3 ? 'complex' : ((_h = quantities.totalRoomCount) !== null && _h !== void 0 ? _h : 0) > 1 ? 'moderate' : 'simple',
-                includedDivisions,
-                excludedDivisions,
-                byOwnerDivisions: [],
-                notApplicableDivisions,
-                totalIncluded: divisionCounts.included,
-                totalExcluded: divisionCounts.excluded,
-            },
-            specialRequirements: clarificationData.specialRequirements || [],
-            exclusions: clarificationData.exclusions || [],
-            timeline: {
-                flexibility: clarificationData.flexibility || 'flexible',
-            },
-        };
-        if (clarificationData.desiredStart) {
-            projectBrief.timeline.desiredStart = clarificationData.desiredStart;
-        }
-        if (clarificationData.deadline) {
-            projectBrief.timeline.deadline = clarificationData.deadline;
-        }
-        // Build CAD data - using schema-valid enum values
-        // Schema requires: fileType: "dwg" | "dxf" | "pdf" | "png" | "jpg"
-        // Schema requires: extractionMethod: "ezdxf" | "vision"
-        const getFileType = (url) => {
-            if (!url)
-                return 'png'; // Default to png
-            const lowerUrl = url.toLowerCase();
-            if (lowerUrl.includes('.dwg'))
-                return 'dwg';
-            if (lowerUrl.includes('.dxf'))
-                return 'dxf';
-            if (lowerUrl.includes('.pdf'))
-                return 'pdf';
-            if (lowerUrl.includes('.jpg') || lowerUrl.includes('.jpeg'))
-                return 'jpg';
-            return 'png'; // Default to png
-        };
-        const cadData = {
-            fileUrl: planImageUrl || 'placeholder://no-image-uploaded',
-            fileType: getFileType(planImageUrl),
-            extractionMethod: 'vision',
-            extractionConfidence: quantities.hasScale ? 0.95 : 0.6,
-            spaceModel,
-            spatialRelationships: {
-                layoutNarrative: spatialNarrative,
-                roomAdjacencies: [],
-                entryPoints: [],
-            },
-        };
-        // Add project-specific data based on project type
-        if (projectSpecificData.kitchenSpecific) {
-            cadData.kitchenSpecific = projectSpecificData.kitchenSpecific;
-        }
-        if (projectSpecificData.bathroomSpecific) {
-            cadData.bathroomSpecific = projectSpecificData.bathroomSpecific;
-        }
-        if (projectSpecificData.bedroomSpecific) {
-            cadData.bedroomSpecific = projectSpecificData.bedroomSpecific;
-        }
-        if (projectSpecificData.livingAreaSpecific) {
-            cadData.livingAreaSpecific = projectSpecificData.livingAreaSpecific;
-        }
-        // Build flags with enhanced data (defensive: copy warnings array to allow mutation)
-        const flags = {
-            lowConfidenceItems: [],
-            missingData: [...((_j = quantities.warnings) !== null && _j !== void 0 ? _j : [])],
-            userVerificationRequired: !((_k = quantities.hasScale) !== null && _k !== void 0 ? _k : false),
-            verificationItems: [],
-        };
-        if (!quantities.hasScale) {
-            flags.lowConfidenceItems.push({
-                field: 'scale',
-                confidence: 0.0,
-                reason: 'No scale set - all measurements are in pixels',
-            });
-        }
-        // Add scope ambiguities from LLM inference as verification items
-        if (inferenceResult === null || inferenceResult === void 0 ? void 0 : inferenceResult.scopeAmbiguities) {
-            for (const ambiguity of inferenceResult.scopeAmbiguities) {
-                if (ambiguity === null || ambiguity === void 0 ? void 0 : ambiguity.clarificationNeeded) {
-                    flags.verificationItems.push(ambiguity.clarificationNeeded);
-                }
-                if (ambiguity === null || ambiguity === void 0 ? void 0 : ambiguity.issue) {
-                    flags.missingData.push(ambiguity.issue);
-                }
-            }
-        }
-        const clarificationOutput = {
-            estimateId,
-            schemaVersion: '3.0.0',
-            timestamp: new Date().toISOString(),
-            clarificationStatus: quantities.hasScale ? 'complete' : 'needs_review',
-            projectBrief,
-            csiScope,
-            cadData,
-            conversation: {
-                inputMethod: 'mixed',
-                messageCount: 0,
-                clarificationQuestions: [],
-                confidenceScore: quantities.hasScale ? 0.95 : 0.5,
-            },
-            flags,
-            // Include computed quantities summary for transparency (with safe defaults)
-            computedQuantities: {
-                source: 'user_annotations',
-                hasScale: (_l = quantities.hasScale) !== null && _l !== void 0 ? _l : false,
-                scaleUnit: (_m = quantities.scaleUnit) !== null && _m !== void 0 ? _m : 'pixels',
-                totalWallLength: (_o = quantities.totalWallLength) !== null && _o !== void 0 ? _o : 0,
-                totalFloorArea: (_p = quantities.totalFloorArea) !== null && _p !== void 0 ? _p : 0,
-                totalRoomCount: (_q = quantities.totalRoomCount) !== null && _q !== void 0 ? _q : 0,
-                totalDoorCount: (_r = quantities.totalDoorCount) !== null && _r !== void 0 ? _r : 0,
-                totalWindowCount: (_s = quantities.totalWindowCount) !== null && _s !== void 0 ? _s : 0,
-                layerSummary: (_t = quantities.layerSummary) !== null && _t !== void 0 ? _t : {},
-            },
-            // Include inference metadata for transparency (with safe defaults for nested fields)
-            inferenceMetadata: inferenceResult ? {
-                roomTypesInferred: ((_u = inferenceResult.roomTypes) !== null && _u !== void 0 ? _u : []).length,
-                itemsInferred: ((_v = inferenceResult.inferredItems) !== null && _v !== void 0 ? _v : []).length,
-                allowancesAdded: ((_w = inferenceResult.standardAllowances) !== null && _w !== void 0 ? _w : []).length,
-                ambiguitiesFound: ((_x = inferenceResult.scopeAmbiguities) !== null && _x !== void 0 ? _x : []).length,
-                materialsRecommended: ((_z = (_y = inferenceResult.materialsAndFinishes) === null || _y === void 0 ? void 0 : _y.recommended) !== null && _z !== void 0 ? _z : []).length,
-            } : null,
-        };
-        // ===================
-        // STEP 8: VALIDATE AND AUTO-FIX OUTPUT
-        // ===================
-        console.log('[ESTIMATION] Validating ClarificationOutput...');
-        // First validate
-        const validationResult = (0, schemaValidator_1.validateClarificationOutput)(clarificationOutput);
-        console.log(`[ESTIMATION] Validation: ${validationResult.isValid ? 'PASSED' : 'NEEDS FIXES'}, Score: ${validationResult.completenessScore}/100`);
-        if (validationResult.errors.length > 0) {
-            console.log(`[ESTIMATION] Found ${validationResult.errors.length} errors, ${validationResult.warnings.length} warnings`);
-            console.log((0, schemaValidator_1.getValidationSummary)(validationResult));
-        }
-        // Auto-fix common issues
-        const fixedOutput = (0, schemaValidator_1.autoFixClarificationOutput)(clarificationOutput);
-        // Re-validate after fix
-        const finalValidation = (0, schemaValidator_1.validateClarificationOutput)(fixedOutput);
-        console.log(`[ESTIMATION] After auto-fix: ${finalValidation.isValid ? 'PASSED' : 'STILL HAS ISSUES'}, Score: ${finalValidation.completenessScore}/100`);
+        const { fixedOutput, finalValidation } = assembleClarificationOutput({ estimateId, csiScope, quantities,
+            clarificationData, scopeText, planImageUrl, spaceModel, projectSpecificData, spatialNarrative, inferenceResult });
         // Save to Firestore (use set with merge to create if doesn't exist)
         // Note: db already initialized and user access verified at start of function
         await db.collection('projects').doc(projectId)
             .collection('estimations').doc(sessionId)
             .set({
             clarificationOutput: fixedOutput,
-            status: finalValidation.isValid ? 'complete' : 'needs_review',
+            status: fixedOutput.clarificationStatus,
             validationScore: finalValidation.completenessScore,
             validationErrors: finalValidation.errors,
             validationWarnings: finalValidation.warnings,
@@ -622,10 +642,10 @@ exports.estimationPipeline = (0, https_1.onCall)({
             updatedAt: firestore_1.FieldValue.serverTimestamp(),
             createdAt: firestore_1.FieldValue.serverTimestamp(), // Will only be set on create due to merge
         }, { merge: true });
-        console.log(`[ESTIMATION] Complete. Generated estimate ${estimateId}`);
-        console.log(`[ESTIMATION] Used ${quantities.hasScale ? 'annotation-based' : 'pixel-only'} measurements`);
-        console.log(`[ESTIMATION] Wall length: ${quantities.totalWallLength} ${quantities.scaleUnit}`);
-        console.log(`[ESTIMATION] Floor area: ${quantities.totalFloorArea} sq ${quantities.scaleUnit}`);
+        (0, safeDiagnostics_1.safeLog)('estimationPipeline.log', `[ESTIMATION] Complete. Generated estimate ${estimateId}`);
+        (0, safeDiagnostics_1.safeLog)('estimationPipeline.log', `[ESTIMATION] Used ${quantities.hasScale ? 'annotation-based' : 'pixel-only'} measurements`);
+        (0, safeDiagnostics_1.safeLog)('estimationPipeline.log', `[ESTIMATION] Wall length: ${quantities.totalWallLength} ${quantities.scaleUnit}`);
+        (0, safeDiagnostics_1.safeLog)('estimationPipeline.log', `[ESTIMATION] Floor area: ${quantities.totalFloorArea} sq ${quantities.scaleUnit}`);
         return {
             success: true,
             estimateId,
@@ -644,11 +664,11 @@ exports.estimationPipeline = (0, https_1.onCall)({
         };
     }
     catch (error) {
-        console.error('Estimation Pipeline Error:', error);
+        (0, safeDiagnostics_1.safeLog)('estimationPipeline.error', 'Estimation Pipeline Error:', error);
         if (error instanceof https_1.HttpsError) {
             throw error;
         }
-        throw new https_1.HttpsError('internal', `Estimation failed: ${error instanceof Error ? error.message : String(error)}`);
+        throw new https_1.HttpsError('internal', 'Operation failed');
     }
 });
 //# sourceMappingURL=estimationPipeline.js.map

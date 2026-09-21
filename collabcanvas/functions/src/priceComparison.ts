@@ -1,7 +1,11 @@
-import { onCall, HttpsError } from 'firebase-functions/v2/https';
+import {safeLog, safeErrorMessage} from './safeDiagnostics';
+import { HttpsError, onRequest } from 'firebase-functions/v2/https';
+import { onCall, allowedOrigins } from './functionSecurity';
 import * as admin from 'firebase-admin';
 import { getFirestore, Firestore } from 'firebase-admin/firestore';
 import OpenAI from 'openai';
+import {verifyPricingService, pricingIdentityConfig} from './serviceIdentity';
+import { isOpenAIEnabled } from './openaiAvailability';
 // Global Materials Database imports
 import {
   findInGlobalMaterials,
@@ -93,7 +97,7 @@ function isSerpApiAvailable(): boolean {
 
   // Reset circuit breaker after timeout
   if (serpApiQuotaExhaustedAt && Date.now() - serpApiQuotaExhaustedAt > SERPAPI_QUOTA_RESET_MS) {
-    console.log('[PRICE_COMPARISON] SerpApi circuit breaker reset');
+    safeLog('priceComparison.log', '[PRICE_COMPARISON] SerpApi circuit breaker reset');
     serpApiQuotaExhausted = false;
     serpApiQuotaExhaustedAt = null;
     return true;
@@ -105,7 +109,7 @@ function isSerpApiAvailable(): boolean {
 function markSerpApiQuotaExhausted(): void {
   serpApiQuotaExhausted = true;
   serpApiQuotaExhaustedAt = Date.now();
-  console.log('[PRICE_COMPARISON] SerpApi circuit breaker TRIPPED - quota exhausted');
+  safeLog('priceComparison.log', '[PRICE_COMPARISON] SerpApi circuit breaker TRIPPED - quota exhausted');
 }
 
 // ============ SERPAPI GOOGLE SHOPPING ============
@@ -120,13 +124,13 @@ async function fetchFromSerpApi(
 ): Promise<unknown[]> {
   // Check circuit breaker first
   if (!isSerpApiAvailable()) {
-    console.log(`[PRICE_COMPARISON] SerpApi circuit breaker OPEN - skipping API call for "${productName}"`);
+    safeLog('priceComparison.log', `[PRICE_COMPARISON] SerpApi circuit breaker OPEN - skipping API call for "${productName}"`);
     return [];
   }
 
   const apiKey = process.env.SERP_API_KEY;
   if (!apiKey) {
-    console.error('[PRICE_COMPARISON] SERP_API_KEY not configured');
+    safeLog('priceComparison.error', '[PRICE_COMPARISON] SERP_API_KEY not configured');
     throw new Error('SERP_API_KEY not configured');
   }
 
@@ -140,7 +144,7 @@ async function fetchFromSerpApi(
   });
 
   const url = `https://serpapi.com/search?${params}`;
-  console.log(`[PRICE_COMPARISON] SerpApi: "${productName}" for ${retailer}`);
+  safeLog('priceComparison.log', `[PRICE_COMPARISON] SerpApi: "${productName}" for ${retailer}`);
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), SERPAPI_TIMEOUT_MS);
@@ -151,7 +155,7 @@ async function fetchFromSerpApi(
 
     if (!res.ok) {
       const errorText = await res.text();
-      console.error(`[PRICE_COMPARISON] SerpApi error: ${res.status} - ${errorText}`);
+      safeLog('priceComparison.error', `[PRICE_COMPARISON] SerpApi error: ${res.status} - ${errorText}`);
 
       // Check for quota exhaustion (429) and trip circuit breaker
       if (res.status === 429 || errorText.includes('run out of searches')) {
@@ -165,11 +169,11 @@ async function fetchFromSerpApi(
     const allResults = data.shopping_results || [];
 
     // Log raw response for debugging
-    console.log(`[PRICE_COMPARISON] SerpApi raw response keys:`, Object.keys(data));
+    safeLog('priceComparison.log', `[PRICE_COMPARISON] SerpApi raw response keys:`, Object.keys(data));
     if (allResults.length > 0) {
-      console.log(`[PRICE_COMPARISON] SerpApi first result sample:`, JSON.stringify(allResults[0]).substring(0, 500));
+      safeLog('priceComparison.log', `[PRICE_COMPARISON] SerpApi first result sample:`, JSON.stringify(allResults[0]).substring(0, 500));
     } else {
-      console.log(`[PRICE_COMPARISON] SerpApi NO shopping_results found. Full response:`, JSON.stringify(data).substring(0, 1000));
+      safeLog('priceComparison.log', `[PRICE_COMPARISON] SerpApi NO shopping_results found. Full response:`, JSON.stringify(data).substring(0, 1000));
     }
 
     // Filter results by merchant pattern
@@ -178,20 +182,20 @@ async function fetchFromSerpApi(
       const source = String(result.source || '');
       const matches = merchantPattern.test(source);
       if (!matches && allResults.length > 0) {
-        console.log(`[PRICE_COMPARISON] Filtering out "${source}" (not matching ${retailer})`);
+        safeLog('priceComparison.log', `[PRICE_COMPARISON] Filtering out "${source}" (not matching ${retailer})`);
       }
       return matches;
     });
 
-    console.log(`[PRICE_COMPARISON] SerpApi: ${allResults.length} total -> ${filteredResults.length} from ${retailer}`);
+    safeLog('priceComparison.log', `[PRICE_COMPARISON] SerpApi: ${allResults.length} total -> ${filteredResults.length} from ${retailer}`);
     return filteredResults;
   } catch (err) {
     clearTimeout(timeoutId);
     if (err instanceof Error && err.name === 'AbortError') {
-      console.error(`[PRICE_COMPARISON] SerpApi timeout for ${retailer}`);
+      safeLog('priceComparison.error', `[PRICE_COMPARISON] SerpApi timeout for ${retailer}`);
       return [];
     }
-    console.error(`[PRICE_COMPARISON] SerpApi fetch error:`, err);
+    safeLog('priceComparison.error', `[PRICE_COMPARISON] SerpApi fetch error:`, err);
     return [];
   }
 }
@@ -217,14 +221,14 @@ export function parseMatchResult(content: string): { index: number; confidence: 
     };
   } catch (err) {
     // Fallback if JSON parsing fails - return no match rather than guessing
-    console.warn('[PRICE_COMPARISON] JSON parse failed for content:', cleaned.substring(0, 100), 'Error:', err);
+    safeLog('priceComparison.warn', '[PRICE_COMPARISON] JSON parse failed for content:', cleaned.substring(0, 100), 'Error:', err);
     return { index: -1, confidence: 0, reasoning: 'Fallback - no match (JSON parse failed)' };
   }
 }
 
 // ============ LLM MATCHING ============
 
-async function selectBestMatch(
+export async function selectBestMatch(
   productName: string,
   results: unknown[],
   retailer: Retailer
@@ -233,13 +237,12 @@ async function selectBestMatch(
     return { index: -1, confidence: 0, reasoning: 'No search results' };
   }
 
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    console.error('[PRICE_COMPARISON] OPENAI_API_KEY not configured');
+  if (!isOpenAIEnabled()) {
+    safeLog('priceComparison.error', '[PRICE_COMPARISON] OpenAI unavailable - using fallback');
     return { index: 0, confidence: 0.5, reasoning: 'OpenAI not configured - defaulting to first result' };
   }
 
-  const openai = new OpenAI({ apiKey });
+  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
   try {
     const response = await openai.chat.completions.create({
@@ -261,10 +264,10 @@ Return ONLY JSON: { "index": number, "confidence": number (0-1), "reasoning": "b
     });
 
     const content = response.choices[0]?.message?.content || '{}';
-    console.log(`[PRICE_COMPARISON] LLM response for ${retailer}: ${content.substring(0, 100)}...`);
+    safeLog('priceComparison.log', `[PRICE_COMPARISON] LLM response for ${retailer}: ${content.substring(0, 100)}...`);
     return parseMatchResult(content);
   } catch (err) {
-    console.error(`[PRICE_COMPARISON] OpenAI error for ${retailer}:`, err);
+    safeLog('priceComparison.error', `[PRICE_COMPARISON] OpenAI error for ${retailer}:`, err);
     return { index: 0, confidence: 0.5, reasoning: 'OpenAI error - defaulting to first result' };
   }
 }
@@ -277,7 +280,7 @@ Return ONLY JSON: { "index": number, "confidence": number (0-1), "reasoning": "b
  */
 function normalizeSerpApiProduct(rawProduct: unknown, retailer: Retailer): RetailerProduct | null {
   if (!rawProduct || typeof rawProduct !== 'object') {
-    console.log(`[PRICE_COMPARISON] normalizeSerpApiProduct: invalid rawProduct`);
+    safeLog('priceComparison.log', `[PRICE_COMPARISON] normalizeSerpApiProduct: invalid rawProduct`);
     return null;
   }
 
@@ -301,10 +304,10 @@ function normalizeSerpApiProduct(rawProduct: unknown, retailer: Retailer): Retai
   // SerpApi uses title for name
   const name = String(product.title || '');
 
-  console.log(`[PRICE_COMPARISON] normalizeSerpApiProduct: id=${id}, name=${name.substring(0, 50)}, price=${price}, url=${url ? 'yes' : 'no'}`);
+  safeLog('priceComparison.log', `[PRICE_COMPARISON] normalizeSerpApiProduct: id=${id}, name=${name.substring(0, 50)}, price=${price}, url=${url ? 'yes' : 'no'}`);
 
   if (!id || !name || price <= 0) {
-    console.log(`[PRICE_COMPARISON] normalizeSerpApiProduct: REJECTED - missing id=${!id}, name=${!name}, price=${price <= 0}`);
+    safeLog('priceComparison.log', `[PRICE_COMPARISON] normalizeSerpApiProduct: REJECTED - missing id=${!id}, name=${!name}, price=${price <= 0}`);
     return null;
   }
 
@@ -420,21 +423,20 @@ function buildResultFromGlobalMaterial(
  * Generate aliases and description for a product using LLM
  * This helps improve future matching by creating multiple search terms
  */
-async function generateProductMetadata(
+export async function generateProductMetadata(
   productName: string,
   originalQuery: string,
   brand?: string | null
 ): Promise<{ aliases: string[]; description: string }> {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    console.log('[PRICE_COMPARISON] No OPENAI_API_KEY - using basic aliases');
+  if (!isOpenAIEnabled()) {
+    safeLog('priceComparison.log', '[PRICE_COMPARISON] OpenAI unavailable - using basic aliases');
     return {
       aliases: [originalQuery.toLowerCase().trim()],
       description: productName,
     };
   }
 
-  const openai = new OpenAI({ apiKey });
+  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
   try {
     const response = await openai.chat.completions.create({
@@ -471,14 +473,14 @@ Return ONLY JSON: { "aliases": ["alias1", "alias2", ...], "description": "brief 
       aliases.push(originalQuery.toLowerCase().trim());
     }
 
-    console.log(`[PRICE_COMPARISON] Generated ${aliases.length} aliases for "${productName}"`);
+    safeLog('priceComparison.log', `[PRICE_COMPARISON] Generated ${aliases.length} aliases for "${productName}"`);
 
     return {
       aliases,
       description: parsed.description || productName,
     };
   } catch (err) {
-    console.warn('[PRICE_COMPARISON] Failed to generate product metadata:', err);
+    safeLog('priceComparison.warn', '[PRICE_COMPARISON] Failed to generate product metadata:', err);
     return {
       aliases: [originalQuery.toLowerCase().trim()],
       description: productName,
@@ -502,7 +504,7 @@ async function autoPopulateGlobalMaterials(
 
   // Skip if no successful matches
   if (!hdMatch && !lowesMatch) {
-    console.log(`[PRICE_COMPARISON] No successful matches to auto-populate for "${productName}"`);
+    safeLog('priceComparison.log', `[PRICE_COMPARISON] No successful matches to auto-populate for "${productName}"`);
     return;
   }
 
@@ -564,9 +566,9 @@ async function autoPopulateGlobalMaterials(
       },
       productName
     );
-    console.log(`[PRICE_COMPARISON] Auto-populated global materials for "${productName}" with ${aliases.length} aliases`);
+    safeLog('priceComparison.log', `[PRICE_COMPARISON] Auto-populated global materials for "${productName}" with ${aliases.length} aliases`);
   } catch (err) {
-    console.warn(`[PRICE_COMPARISON] Auto-population failed for "${productName}":`, err);
+    safeLog('priceComparison.warn', `[PRICE_COMPARISON] Auto-population failed for "${productName}":`, err);
     // Non-blocking - don't throw
   }
 }
@@ -579,7 +581,7 @@ async function compareOneProduct(
   const matches: Record<Retailer, MatchResult> = {} as Record<Retailer, MatchResult>;
   const effectiveZipCode = zipCode || DEFAULT_ZIPCODE;
 
-  console.log(`[PRICE_COMPARISON] Comparing product: "${productName}" (zipCode: ${effectiveZipCode})`);
+  safeLog('priceComparison.log', `[PRICE_COMPARISON] Comparing product: "${productName}" (zipCode: ${effectiveZipCode})`);
 
   // Get Firestore instance if not provided (for cache operations)
   const firestoreDb = db || getDb();
@@ -587,14 +589,14 @@ async function compareOneProduct(
   // ========== STEP 1: Check Global Materials Database (FR16) ==========
   try {
     const globalCandidates = await findInGlobalMaterials(firestoreDb, productName, effectiveZipCode);
-    console.log(`[PRICE_COMPARISON] Global materials search returned ${globalCandidates.length} candidates`);
+    safeLog('priceComparison.log', `[PRICE_COMPARISON] Global materials search returned ${globalCandidates.length} candidates`);
 
     if (globalCandidates.length > 0) {
       // ========== STEP 2: LLM Selection from candidates (FR11-FR15) ==========
       const { candidate: bestCandidate, confidence, reasoning } = await selectBestGlobalMatch(productName, globalCandidates);
 
       if (bestCandidate) {
-        console.log(`[PRICE_COMPARISON] Global DB validation: "${productName}" vs "${bestCandidate.name}" -> confidence: ${confidence.toFixed(2)}`);
+        safeLog('priceComparison.log', `[PRICE_COMPARISON] Global DB validation: "${productName}" vs "${bestCandidate.name}" -> confidence: ${confidence.toFixed(2)}`);
 
         if (confidence >= GLOBAL_MATCH_CONFIDENCE_THRESHOLD) {
           // Check if the cached material actually has retailer pricing data
@@ -603,7 +605,7 @@ async function compareOneProduct(
 
           if (hasRetailerData) {
             // ========== STEP 3a: Use Global Cache (FR17-FR19) ==========
-            console.log(`[PRICE_COMPARISON] GLOBAL_DB HIT for "${productName}" (confidence: ${confidence.toFixed(2)})`);
+            safeLog('priceComparison.log', `[PRICE_COMPARISON] GLOBAL_DB HIT for "${productName}" (confidence: ${confidence.toFixed(2)})`);
 
             // FR18: Increment match count (fire-and-forget)
             incrementMatchCount(firestoreDb, bestCandidate.id);
@@ -611,19 +613,19 @@ async function compareOneProduct(
             // FR17, FR34-FR35: Return cached pricing immediately
             return buildResultFromGlobalMaterial(bestCandidate, productName, confidence, reasoning);
           } else {
-            console.log(`[PRICE_COMPARISON] Global DB match found but no retailer pricing data cached, falling back to API`);
+            safeLog('priceComparison.log', `[PRICE_COMPARISON] Global DB match found but no retailer pricing data cached, falling back to API`);
           }
         }
 
-        console.log(`[PRICE_COMPARISON] Global DB confidence too low (${confidence.toFixed(2)} < ${GLOBAL_MATCH_CONFIDENCE_THRESHOLD}), falling back to API`);
+        safeLog('priceComparison.log', `[PRICE_COMPARISON] Global DB confidence too low (${confidence.toFixed(2)} < ${GLOBAL_MATCH_CONFIDENCE_THRESHOLD}), falling back to API`);
       } else {
-        console.log(`[PRICE_COMPARISON] LLM found no good match among ${globalCandidates.length} candidates`);
+        safeLog('priceComparison.log', `[PRICE_COMPARISON] LLM found no good match among ${globalCandidates.length} candidates`);
       }
     } else {
-      console.log(`[PRICE_COMPARISON] No global materials found for "${productName}" in zipCode ${effectiveZipCode}`);
+      safeLog('priceComparison.log', `[PRICE_COMPARISON] No global materials found for "${productName}" in zipCode ${effectiveZipCode}`);
     }
   } catch (err) {
-    console.warn(`[PRICE_COMPARISON] Global materials lookup error:`, err);
+    safeLog('priceComparison.warn', `[PRICE_COMPARISON] Global materials lookup error:`, err);
     // Continue to API fallback
   }
 
@@ -650,13 +652,13 @@ async function compareOneProduct(
           },
         };
       } catch (error) {
-        console.error(`[PRICE_COMPARISON] Error for ${retailer}:`, error);
+        safeLog('priceComparison.error', `[PRICE_COMPARISON] Error for ${retailer}:`, error);
         return {
           retailer,
           match: {
             selectedProduct: null,
             confidence: 0,
-            reasoning: `Error: ${error instanceof Error ? error.message : 'Unknown'}`,
+            reasoning: safeErrorMessage(`Error: ${error instanceof Error ? error.message : 'Unknown'}`),
             searchResultsCount: 0,
           },
         };
@@ -672,13 +674,13 @@ async function compareOneProduct(
   // Determine best price
   const bestPrice = determineBestPrice(matches);
 
-  console.log(`[PRICE_COMPARISON] Completed comparison for "${productName}". Best price: ${bestPrice ? `$${bestPrice.product.price} at ${bestPrice.retailer}` : 'none'}`);
+  safeLog('priceComparison.log', `[PRICE_COMPARISON] Completed comparison for "${productName}". Best price: ${bestPrice ? `$${bestPrice.product.price} at ${bestPrice.retailer}` : 'none'}`);
 
   // ========== STEP 3: Auto-populate Global Materials ==========
   // Save successful API results to global materials for future cache hits
   // Fire-and-forget: don't block on auto-population
   autoPopulateGlobalMaterials(firestoreDb, productName, effectiveZipCode, matches)
-    .catch(err => console.warn(`[PRICE_COMPARISON] Auto-populate error:`, err));
+    .catch(err => safeLog('priceComparison.warn', `[PRICE_COMPARISON] Auto-populate error:`, err));
 
   return {
     originalProductName: productName,
@@ -692,27 +694,27 @@ async function compareOneProduct(
 
 // Export configuration for testing - changes here are detected by tests
 export const comparePricesConfig = {
-  cors: true,
+  cors: allowedOrigins(),
   maxInstances: 10,
   memory: '1GiB' as const,
   timeoutSeconds: 540, // Max for 2nd gen - handles large product lists
   secrets: ['OPENAI_API_KEY', 'SERP_API_KEY'], // Grant access to secrets for LLM matching and SerpApi
 };
 
-export const comparePrices = onCall<{ request: CompareRequest }>(comparePricesConfig, async (req) => {
-  console.log('[PRICE_COMPARISON] Function invoked');
-  console.log('[PRICE_COMPARISON] Request data:', JSON.stringify(req.data));
+export async function processPriceComparison(req: {data: {request: CompareRequest}}, actor: string) {
+  safeLog('priceComparison.log', '[PRICE_COMPARISON] Function invoked');
+  safeLog('priceComparison.log', '[PRICE_COMPARISON] Request data:', JSON.stringify(req.data));
 
   const { projectId, productNames, forceRefresh, zipCode } = req.data?.request || {} as CompareRequest;
 
   // Validate required parameters
   if (!projectId) {
-    console.error('[PRICE_COMPARISON] projectId is required');
+    safeLog('priceComparison.error', '[PRICE_COMPARISON] projectId is required');
     throw new HttpsError('invalid-argument', 'projectId is required');
   }
 
   if (!productNames || !Array.isArray(productNames) || productNames.length === 0) {
-    console.error('[PRICE_COMPARISON] productNames array is required');
+    safeLog('priceComparison.error', '[PRICE_COMPARISON] productNames array is required');
     throw new HttpsError('invalid-argument', 'productNames array is required');
   }
 
@@ -724,7 +726,7 @@ export const comparePrices = onCall<{ request: CompareRequest }>(comparePricesCo
   if (!forceRefresh) {
     const existingDoc = await docRef.get();
     if (existingDoc.exists && existingDoc.data()?.status === 'complete') {
-      console.log('[PRICE_COMPARISON] Returning cached results');
+      safeLog('priceComparison.log', '[PRICE_COMPARISON] Returning cached results');
       return { cached: true };
     }
   }
@@ -736,10 +738,10 @@ export const comparePrices = onCall<{ request: CompareRequest }>(comparePricesCo
     completedProducts: 0,
     results: [],
     startedAt: Date.now(),
-    createdBy: req.auth?.uid || 'anonymous',
+    createdBy: actor,
   });
 
-  console.log(`[PRICE_COMPARISON] Starting comparison for ${productNames.length} products`);
+  safeLog('priceComparison.log', `[PRICE_COMPARISON] Starting comparison for ${productNames.length} products`);
 
   const results: ComparisonResult[] = [];
 
@@ -755,7 +757,7 @@ export const comparePrices = onCall<{ request: CompareRequest }>(comparePricesCo
         results: results,
       });
 
-      console.log(`[PRICE_COMPARISON] Progress: ${results.length}/${productNames.length} products completed`);
+      safeLog('priceComparison.log', `[PRICE_COMPARISON] Progress: ${results.length}/${productNames.length} products completed`);
     }
 
     // 4. Mark complete
@@ -764,17 +766,31 @@ export const comparePrices = onCall<{ request: CompareRequest }>(comparePricesCo
       completedAt: Date.now(),
     });
 
-    console.log('[PRICE_COMPARISON] Comparison complete');
+    safeLog('priceComparison.log', '[PRICE_COMPARISON] Comparison complete');
     return { cached: false };
 
   } catch (error) {
     // Handle errors gracefully - preserve partial results
-    console.error('[PRICE_COMPARISON] Error during comparison:', error);
+    safeLog('priceComparison.error', '[PRICE_COMPARISON] Error during comparison:', error);
     await docRef.update({
       status: 'error' as ComparisonStatus,
       results: results, // Preserve any partial results completed before error
-      error: error instanceof Error ? error.message : 'Unknown error',
+      error: safeErrorMessage(error instanceof Error ? error.message : 'Unknown error'),
     });
     throw new HttpsError('internal', 'Price comparison failed');
   }
+
+}
+
+export const comparePrices = onCall<{ request: CompareRequest }>(comparePricesConfig, req => processPriceComparison(req, req.auth!.uid));
+
+// Separate service endpoint: IAM private + application OIDC verification; no browser token bypass.
+export const comparePricesService = onRequest({...comparePricesConfig, cors:false, invoker:'private'}, async (req,res)=> {
+  if(req.method!=='POST') { res.status(405).json({error:{code:'METHOD_NOT_ALLOWED'}}); return; }
+  try { await verifyPricingService(req.headers.authorization); }
+  catch { res.status(403).json({error:{code:'SERVICE_AUTH_REJECTED'}}); return; }
+  try {
+    const result=await processPriceComparison({data:req.body?.data}, pricingIdentityConfig().principal);
+    res.status(200).json({result});
+  } catch { res.status(500).json({error:{code:'PRICING_UNAVAILABLE'}}); }
 });

@@ -1,3 +1,4 @@
+import { getPythonFunctionsUrl } from './pythonFunctions';
 import { initializeApp } from 'firebase/app';
 import type { FirebaseApp } from 'firebase/app';
 import { getAuth, connectAuthEmulator } from 'firebase/auth';
@@ -46,6 +47,14 @@ if (import.meta.env.DEV && !emulatorsAlreadyConnected) {
     useFunctionsEmulator,
     useFirestoreEmulator,
   });
+}
+
+// Fail before SDK initialization in production builds with development configuration.
+if (import.meta.env.PROD) {
+  getPythonFunctionsUrl();
+  if (Object.values(firebaseConfig).some(value => !value)) {
+    throw new Error('Complete production Firebase configuration is required');
+  }
 }
 
 // Initialize Firebase app
