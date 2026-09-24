@@ -95,9 +95,7 @@ python [your_main_file].py
 
 ![TrueCost Input](screenshots/input.png)
 
-### Results
 
-![TrueCost Results](screenshots/results.png)
 
 ---
 
