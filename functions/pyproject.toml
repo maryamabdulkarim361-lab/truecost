@@ -2,9 +2,12 @@
 name = "truecost-backend"
 version = "0.1.0"
 dependencies = [
-    "python-dotenv",
     "flask",
-    "flask-cors"
+    "flask-cors",
+    "python-dotenv",
+    "pydantic",
+    "google-generativeai",
+    "requests"
 ]
 
 [tool.vercel]
