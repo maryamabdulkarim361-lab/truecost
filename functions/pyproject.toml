@@ -1,7 +1,11 @@
 [project]
 name = "truecost-backend"
 version = "0.1.0"
-dependencies = []
+dependencies = [
+    "python-dotenv",
+    "flask",
+    "flask-cors"
+]
 
 [tool.vercel]
 entrypoint = "serve_local:app"
