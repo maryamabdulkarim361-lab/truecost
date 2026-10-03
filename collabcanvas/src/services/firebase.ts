@@ -3,7 +3,7 @@ import { initializeApp } from 'firebase/app';
 import type { FirebaseApp } from 'firebase/app';
 import { getAuth, connectAuthEmulator } from 'firebase/auth';
 import type { Auth } from 'firebase/auth';
-import { getFirestore, connectFirestoreEmulator, enableNetwork, disableNetwork } from 'firebase/firestore';
+import { initializeFirestore, connectFirestoreEmulator, enableNetwork, disableNetwork } from 'firebase/firestore';
 import type { Firestore } from 'firebase/firestore';
 import { getDatabase, connectDatabaseEmulator, goOnline, goOffline } from 'firebase/database';
 import type { Database } from 'firebase/database';
