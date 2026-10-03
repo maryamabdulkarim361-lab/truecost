@@ -6,7 +6,7 @@ Provides HTTP endpoints for:
 - Deleting estimates
 - A2A endpoints for all 19 agents
 """
-
+from serve_local import app
 # macOS fork safety fix - must be at the very top before other imports
 import os
 import sys
