@@ -62,7 +62,9 @@ export const app: FirebaseApp = initializeApp(firebaseConfig);
 
 // Initialize Firebase services
 export const auth: Auth = getAuth(app);
-export const firestore: Firestore = getFirestore(app);
+export const firestore: Firestore = initializeFirestore(app, {
+  ignoreUndefinedProperties: true,
+});
 export const rtdb: Database = getDatabase(app);
 export const functions: Functions = getFunctions(app, 'us-central1');
 export const storage: FirebaseStorage = getStorage(app);
