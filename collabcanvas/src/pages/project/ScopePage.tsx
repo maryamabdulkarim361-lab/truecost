@@ -16,10 +16,33 @@ import ARCoreRoomScanner, { type ScanResult } from '../../plugins/ARCoreRoomScan
 import { generateFloorPlanFromScan } from '../../services/floorPlanGenerator';
 import type { BackgroundImage } from '../../types';
 import type { EstimateConfig } from '../../types/project';
-import { parseManualAddress } from '../../components/ui/AddressAutocomplete';
 
 // Re-export EstimateConfig for backward compatibility
 export type { EstimateConfig } from '../../types/project';
+
+const US_STATES = 'AL AK AZ AR CA CO CT DE DC FL GA HI ID IL IN IA KS KY LA ME MD MA MI MN MS MO MT NE NV NH NJ NM NY NC ND OH OK OR PA RI SC SD TN TX UT VT VA WA WV WI WY PR GU VI AS MP'.split(' ');
+
+/**
+ * Parses a manually typed address in the format: Street, City, ST ZIP
+ * Example: 123 Main Street, Austin, TX 78701
+ * Syntax-only check; it does not verify that the address really exists.
+ */
+function parseTypedAddress(value: string): ParsedAddress | null {
+  const match = value
+    .trim()
+    .match(/^(.+?),\s*([^,]+),\s*([A-Za-z]{2})\s+(\d{5}(?:-\d{4})?)$/);
+  if (!match) return null;
+  const [, street, city, state, zipCode] = match;
+  if (!street.trim() || !city.trim() || !US_STATES.includes(state.toUpperCase())) return null;
+  return {
+    formattedAddress: value.trim(),
+    streetAddress: street.trim(),
+    city: city.trim(),
+    state: state.toUpperCase(),
+    zipCode,
+    country: 'US',
+  };
+}
 
 /**
  * ScopePage - Combined form for project creation/editing with file upload.
@@ -56,6 +79,14 @@ export function ScopePage() {
 
   // Parsed address components (extracted from autocomplete selection)
   const [parsedAddress, setParsedAddress] = useState<ParsedAddress | null>(null);
+
+  // If the typed address matches "Street, City, ST ZIP", parse it automatically.
+  // This covers browser autofill and the case where Google Maps autocomplete is not configured.
+  useEffect(() => {
+    if (parsedAddress || !formData.address) return;
+    const parsed = parseTypedAddress(formData.address);
+    if (parsed) setParsedAddress(parsed);
+  }, [formData.address, parsedAddress]);
 
   const [uploadedFile, setUploadedFile] = useState<File | null>(null);
   const [preparedBackground, setPreparedBackground] = useState<BackgroundImage | null>(null);
@@ -503,20 +534,18 @@ export function ScopePage() {
     }
   };
 
-  // Form is valid if we have a name, a valid parsed address with ZIP code, scope definition, and either a plan file OR a scan result
-  const hasPlanOrScan = uploadedFile || existingPlanUrl || scanResult?.success;
-    useEffect(() => {
-    if (!parsedAddress && formData.address) {
-      const p = parseManualAddress(formData.address);
-      if (p) setParsedAddress(p);
-    }
-  }, [formData.address, parsedAddress]);
+  // Form is valid if we have a name, a valid parsed address with ZIP code, scope definition,
+  // and either a prepared plan image, an existing plan, or a scan result.
+  // For a newly selected file we wait until the image has been read (preparedBackground).
+  const hasPlanOrScan = uploadedFile
+    ? !!preparedBackground
+    : (existingPlanUrl || scanResult?.success);
+
   const isFormValid = formData.name.trim() &&
     parsedAddress &&
     parsedAddress.zipCode.trim().length >= 5 &&
     formData.scopeDefinition.trim() &&
     hasPlanOrScan;
-    console.log('FORM CHECK', { name: !!formData.name.trim(), parsedAddress, scope: !!formData.scopeDefinition.trim(), hasPlanOrScan: !!hasPlanOrScan, isSubmitting, loading });
 
   // Get actual completion state from hook
   const { completedSteps } = useStepCompletion(projectId);
