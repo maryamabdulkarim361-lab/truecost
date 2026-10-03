@@ -44,8 +44,11 @@ os.environ.setdefault('FIRESTORE_EMULATOR_HOST', '127.0.0.1:8081')
 # Validate only the selected provider's environment credential.
 from config.settings import settings
 
-
 def validate_local_llm_environment():
+    # Bypass strict key check on Vercel/Production deployment
+    if os.environ.get("VERCEL") or os.environ.get("DISABLE_OPENAI", "false").lower() == "true":
+        return
+
     if not os.environ.get(settings.llm_key_env):
         raise RuntimeError(f"{settings.llm_key_env} is required for the selected LLM provider")
 
