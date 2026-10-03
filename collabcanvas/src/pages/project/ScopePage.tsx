@@ -16,6 +16,7 @@ import ARCoreRoomScanner, { type ScanResult } from '../../plugins/ARCoreRoomScan
 import { generateFloorPlanFromScan } from '../../services/floorPlanGenerator';
 import type { BackgroundImage } from '../../types';
 import type { EstimateConfig } from '../../types/project';
+import { parseManualAddress } from '../../components/ui/AddressAutocomplete';
 
 // Re-export EstimateConfig for backward compatibility
 export type { EstimateConfig } from '../../types/project';
@@ -504,6 +505,12 @@ export function ScopePage() {
 
   // Form is valid if we have a name, a valid parsed address with ZIP code, scope definition, and either a plan file OR a scan result
   const hasPlanOrScan = uploadedFile || existingPlanUrl || scanResult?.success;
+    useEffect(() => {
+    if (!parsedAddress && formData.address) {
+      const p = parseManualAddress(formData.address);
+      if (p) setParsedAddress(p);
+    }
+  }, [formData.address, parsedAddress]);
   const isFormValid = formData.name.trim() &&
     parsedAddress &&
     parsedAddress.zipCode.trim().length >= 5 &&
