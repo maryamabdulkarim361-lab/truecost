@@ -1,6 +1,6 @@
 # TrueCost Deep Agent Pipeline - Python Dependencies
 
-structlog
+structlog==24.4.0
 
 # Firebase
 firebase-admin>=6.0.0,<7.0.0
