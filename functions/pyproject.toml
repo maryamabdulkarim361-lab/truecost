@@ -3,12 +3,26 @@ name = "truecost-backend"
 version = "0.1.0"
 dependencies = [
     "flask",
-    "flask-cors",
-    "python-dotenv",
-    "pydantic",
-    "google-generativeai",
+    "flask-cors>=4.0.0",
+    "python-dotenv>=1.0.0",
     "requests",
-    "structlog",
+    "google-generativeai",
+    "structlog>=23.0.0,<25.0.0",
+    "pydantic>=2.4.0,<3.0.0",
+    "firebase-admin>=6.0.0,<7.0.0",
+    "firebase-functions>=0.4.0,<1.0.0",
+    "google-cloud-secret-manager>=2.16.0,<3.0.0",
+    "openai>=1.0.0",
+    "langchain>=0.1.0",
+    "langchain-openai>=0.1.0",
+    "langgraph>=0.2.0",
+    "langchain-core>=0.3.0",
+    "httpx>=0.25.0,<0.28.0",
+    "numpy>=1.26.0,<2.0.0",
+    "weasyprint>=61.2,<62.0",
+    "pydyf>=0.10.0,<0.11",
+    "jinja2>=3.1.0,<4.0.0",
+    "tenacity>=8.0.0,<9.0.0",
 ]
 
 [tool.vercel]
