@@ -509,6 +509,7 @@ export function ScopePage() {
     parsedAddress.zipCode.trim().length >= 5 &&
     formData.scopeDefinition.trim() &&
     hasPlanOrScan;
+    console.log('FORM CHECK', { name: !!formData.name.trim(), parsedAddress, scope: !!formData.scopeDefinition.trim(), hasPlanOrScan: !!hasPlanOrScan, isSubmitting, loading });
 
   // Get actual completion state from hook
   const { completedSteps } = useStepCompletion(projectId);
