@@ -1,0 +1,2 @@
+[tool.vercel]
+entrypoint = "serve_local:app"
