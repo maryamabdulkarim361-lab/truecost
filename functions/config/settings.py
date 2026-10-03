@@ -7,7 +7,11 @@ Secrets are loaded via Firebase Secrets Manager (production) or environment vari
 import os
 from typing import Optional
 from dataclasses import dataclass, field
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 from config.production import validate_production
 
 # Load .env file for non-secret configuration (emulator hosts, feature flags, etc.)
